@@ -32,7 +32,7 @@ jobs:
           goos: ${{ matrix.goos }}
           goarch: ${{ matrix.goarch }}
           goversion: 1.24.3
-          binary_name: "secure-proxy"
+          binary_name: "gotunnel"
           ldflags: "-s -w"
           overwrite: true
           compress_assets: "UPX,tar.gz"
