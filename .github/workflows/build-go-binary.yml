@@ -2,7 +2,9 @@ name: build-go-binary
 
 on:
   release:
-    types: [published] # 更推荐
+    types:
+      - published
+      - created
 
 jobs:
   build-go-binary:
