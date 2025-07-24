@@ -31,5 +31,8 @@ jobs:
           goarch: ${{ matrix.goarch }}
           goversion: 1.24.3
           binary_name: "secure-proxy"
+          ldflags: "-s -w"
+          overwrite: true
+          compress_assets: "UPX,tar.gz"
           # 下面参数仅当 main.go 不在仓库根目录时使用
           # main_package_path: ./cmd/proxy
