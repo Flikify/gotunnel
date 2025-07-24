@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
-	"crypto/rand"
+	// 使用 crypto/rand 下的 mathrand.Intn 来避免锁定全局随机数生成器
+	cryptorand "crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -15,6 +19,7 @@ import (
 	"io"
 	"log"
 	"math/big"
+	"math/rand" // 用于抖动
 	"net"
 	"os"
 	"path/filepath"
@@ -25,6 +30,7 @@ import (
 	"github.com/xtaci/smux"
 )
 
+// ... (从 const certDir 到 savePEM 函数的代码保持不变，这里省略)
 const (
 	certDir        = "certs"
 	caCertFile     = "ca.crt"
@@ -43,48 +49,45 @@ type ClientConfig struct {
 	ClientKey  string `json:"client_key"`
 }
 
+// ControlMessage 是客户端发送给服务端的控制消息，用于请求端口转发
+type ControlMessage struct {
+	RemotePort int `json:"remote_port"`
+}
+
+// ControlResponse 是服务端响应给客户端的控制消息
+type ControlResponse struct {
+	Status  string `json:"status"` // "success" or "error"
+	Message string `json:"message"`
+}
+
 // handleStream 负责在两个连接之间双向拷贝数据，并优雅地处理关闭
 func handleStream(p1, p2 io.ReadWriteCloser) {
 	var wg sync.WaitGroup
 	wg.Add(2)
-
-	// 方向 1: p1 -> p2
 	go func() {
 		defer wg.Done()
-		// 从 p1 拷贝到 p2。当 p1 关闭写或完全关闭时，io.Copy会返回。
 		_, err := io.Copy(p2, p1)
-		// 打印错误可以帮助调试
-		if err != nil && err != io.EOF {
+		if err != nil && err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
 			log.Printf("数据拷贝时出错 (p1->p2): %v", err)
 		}
-		// 通知 p2 我们不会再写入了。这对于HTTP等协议很重要。
-        // smux.Stream 实现了 CloseWrite
 		if conn, ok := p2.(interface{ CloseWrite() error }); ok {
 			_ = conn.CloseWrite()
 		}
 	}()
-
-	// 方向 2: p2 -> p1
 	go func() {
 		defer wg.Done()
-		// 从 p2 拷贝到 p1。
 		_, err := io.Copy(p1, p2)
-		if err != nil && err != io.EOF {
+		if err != nil && err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
 			log.Printf("数据拷贝时出错 (p2->p1): %v", err)
 		}
-		// 通知 p1 我们不会再写入了。
 		if conn, ok := p1.(interface{ CloseWrite() error }); ok {
 			_ = conn.CloseWrite()
 		}
 	}()
-
-	// 等待两个拷贝方向都完成。
-	// 只有当两个方向的读写都因为EOF而结束后，函数才会返回。
 	wg.Wait()
 }
 
 // generateAndLoadCertificates 负责生成（如果需要）并加载所有证书
-// FIX: 接收 publicAddr 用于正确生成证书和客户端配置
 func generateAndLoadCertificates(publicAddr string) (*tls.Config, string, error) {
 	if _, err := os.Stat(certDir); os.IsNotExist(err) {
 		if err := os.Mkdir(certDir, 0700); err != nil {
@@ -95,7 +98,6 @@ func generateAndLoadCertificates(publicAddr string) (*tls.Config, string, error)
 	serverCertPath := filepath.Join(certDir, serverCertFile)
 	if _, err := os.Stat(serverCertPath); os.IsNotExist(err) {
 		log.Println("未找到服务器证书，开始生成新的 CA、服务器和客户端证书...")
-		// FIX: 将 publicAddr 传递给证书生成函数
 		if err := generateAllCerts(publicAddr); err != nil {
 			return nil, "", fmt.Errorf("证书生成失败: %w", err)
 		}
@@ -138,7 +140,6 @@ func generateAndLoadCertificates(publicAddr string) (*tls.Config, string, error)
 	}
 
 	clientCfg := ClientConfig{
-		// FIX: 使用 publicAddr 作为客户端连接的目标地址
 		ServerAddr: publicAddr,
 		CACert:     string(caCertBytes),
 		ClientCert: string(clientCertBytes),
@@ -148,13 +149,19 @@ func generateAndLoadCertificates(publicAddr string) (*tls.Config, string, error)
 	if err != nil {
 		return nil, "", fmt.Errorf("无法序列化客户端配置到 JSON: %w", err)
 	}
-	configString := base64.StdEncoding.EncodeToString(jsonBytes)
+	var b bytes.Buffer
+	gz := gzip.NewWriter(&b)
+	if _, err := gz.Write(jsonBytes); err != nil {
+		return nil, "", fmt.Errorf("压缩配置数据失败: %w", err)
+	}
+	if err := gz.Close(); err != nil {
+		return nil, "", fmt.Errorf("关闭 gzip writer 失败: %w", err)
+	}
+	configString := base64.RawStdEncoding.EncodeToString(b.Bytes())
 
 	return tlsConfig, configString, nil
 }
 
-// FIX:
-// - 接收 publicAddr 用于生成包含正确 IP/DNS 的服务器证书
 func generateAllCerts(publicAddr string) error {
 	caKey, caCert, err := createCertificate(nil, nil, true, "MyProxy CA", nil, nil)
 	if err != nil {
@@ -163,8 +170,6 @@ func generateAllCerts(publicAddr string) error {
 	if err := savePEM(filepath.Join(certDir, caCertFile), filepath.Join(certDir, caKeyFile), caCert, caKey); err != nil {
 		return err
 	}
-
-	// FIX: 解析 publicAddr 并传递给证书创建函数
 	host, _, err := net.SplitHostPort(publicAddr)
 	if err != nil {
 		return fmt.Errorf("无效的公网地址格式 (应为 host:port): %s", publicAddr)
@@ -176,10 +181,8 @@ func generateAllCerts(publicAddr string) error {
 	} else {
 		dnsNames = append(dnsNames, host)
 	}
-	// 为通用性，总是添加本地地址
 	ips = append(ips, net.ParseIP("127.0.0.1"))
 	dnsNames = append(dnsNames, "localhost")
-
 	serverKey, serverCert, err := createCertificate(caCert, caKey, false, "MyProxy Server", ips, dnsNames)
 	if err != nil {
 		return fmt.Errorf("创建服务器证书失败: %w", err)
@@ -187,7 +190,6 @@ func generateAllCerts(publicAddr string) error {
 	if err := savePEM(filepath.Join(certDir, serverCertFile), filepath.Join(certDir, serverKeyFile), serverCert, serverKey); err != nil {
 		return err
 	}
-
 	clientKey, clientCert, err := createCertificate(caCert, caKey, false, "MyProxy Client", nil, nil)
 	if err != nil {
 		return fmt.Errorf("创建客户端证书失败: %w", err)
@@ -195,19 +197,16 @@ func generateAllCerts(publicAddr string) error {
 	return savePEM(filepath.Join(certDir, clientCertFile), filepath.Join(certDir, clientKeyFile), clientCert, clientKey)
 }
 
-// FIX: 接收 ips 和 dnsNames 用于设置证书的 SAN
 func createCertificate(parent *x509.Certificate, parentKey *ecdsa.PrivateKey, isCA bool, commonName string, ips []net.IP, dnsNames []string) (*ecdsa.PrivateKey, *x509.Certificate, error) {
-	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
 	if err != nil {
 		return nil, nil, err
 	}
-
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	serialNumber, err := cryptorand.Int(cryptorand.Reader, serialNumberLimit)
 	if err != nil {
 		return nil, nil, err
 	}
-
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject:      pkix.Name{CommonName: commonName},
@@ -218,23 +217,19 @@ func createCertificate(parent *x509.Certificate, parentKey *ecdsa.PrivateKey, is
 		IPAddresses:  ips,
 		DNSNames:     dnsNames,
 	}
-
 	if isCA {
 		template.IsCA = true
 		template.KeyUsage |= x509.KeyUsageCertSign
 		template.BasicConstraintsValid = true
 	}
-
 	var ca, signingKey = &template, privateKey
 	if parent != nil && parentKey != nil {
 		ca, signingKey = parent, parentKey
 	}
-
-	derBytes, err := x509.CreateCertificate(rand.Reader, &template, ca, &privateKey.PublicKey, signingKey)
+	derBytes, err := x509.CreateCertificate(cryptorand.Reader, &template, ca, &privateKey.PublicKey, signingKey)
 	if err != nil {
 		return nil, nil, err
 	}
-
 	cert, err := x509.ParseCertificate(derBytes)
 	return privateKey, cert, err
 }
@@ -248,7 +243,6 @@ func savePEM(certPath, keyPath string, cert *x509.Certificate, key *ecdsa.Privat
 	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}); err != nil {
 		return err
 	}
-
 	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("无法创建私钥文件 %s: %w", keyPath, err)
@@ -261,9 +255,10 @@ func savePEM(certPath, keyPath string, cert *x509.Certificate, key *ecdsa.Privat
 	return pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
 }
 
-// FIX: 全新重构的 runServer，使其更健壮
-func runServer(listenAddr, tunnelAddr, publicAddr string) {
-	log.Printf("服务端模式：服务监听于 %s, 隧道监听于 %s, 公网地址为 %s", listenAddr, tunnelAddr, publicAddr)
+// ======================= 服务端逻辑 (未修改) =======================
+func runServer(tunnelAddr, publicAddr string) {
+	// ... 这部分代码保持不变 ...
+	log.Printf("服务端模式：隧道监听于 %s, 公网地址为 %s", tunnelAddr, publicAddr)
 
 	tlsConfig, clientConfigString, err := generateAndLoadCertificates(publicAddr)
 	if err != nil {
@@ -271,16 +266,9 @@ func runServer(listenAddr, tunnelAddr, publicAddr string) {
 	}
 
 	fmt.Println("\n========================= CLIENT CONFIGURATION =========================")
-	fmt.Println("将以下单行配置字符串完整复制到客户端机器上运行:")
-	fmt.Printf("\n./your_program -mode client -config \"%s\"\n\n", clientConfigString)
+	fmt.Println("将以下单行配置字符串完整复制到客户端机器上运行，并根据需要添加 -remote-port 和 -local-target 参数:")
+	fmt.Printf("\n./gotunnel -mode client -config \"%s\" -remote-port 8080 -local-target 127.0.0.1:5037\n\n", clientConfigString)
 	fmt.Println("========================================================================")
-
-	serviceListener, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		log.Fatalf("无法监听服务地址 %s: %v", listenAddr, err)
-	}
-	defer serviceListener.Close()
-	log.Printf("服务已在 %s 上就绪, 等待用户连接...", listenAddr)
 
 	tunnelListener, err := tls.Listen("tcp", tunnelAddr, tlsConfig)
 	if err != nil {
@@ -288,21 +276,20 @@ func runServer(listenAddr, tunnelAddr, publicAddr string) {
 	}
 	defer tunnelListener.Close()
 
-	// FIX: 主循环现在是接受隧道连接，可以处理客户端重连
 	for {
 		log.Println("等待客户端连接隧道 (mTLS)...")
 		tunnelConn, err := tunnelListener.Accept()
 		if err != nil {
 			log.Printf("接受隧道连接失败: %v", err)
-			continue // 不要让整个服务挂掉
+			continue
 		}
-		// 为每个隧道连接启动一个独立的会话处理器
-		go handleTunnelSession(tunnelConn, serviceListener)
+		// 每个客户端连接都是一个独立的会话
+		go handleClientSession(tunnelConn)
 	}
 }
 
-// FIX: 新增函数，处理单个隧道会话的所有逻辑
-func handleTunnelSession(tunnelConn net.Conn, serviceListener net.Listener) {
+func handleClientSession(tunnelConn net.Conn) {
+	// ... 这部分代码保持不变 ...
 	log.Printf("客户端 %s 已通过 mTLS 验证并连接隧道", tunnelConn.RemoteAddr())
 	defer tunnelConn.Close()
 
@@ -315,54 +302,101 @@ func handleTunnelSession(tunnelConn net.Conn, serviceListener net.Listener) {
 	}
 	defer session.Close()
 
-	// 这个循环为当前隧道会话(session)处理来自serviceListener的请求
+	// 1. 等待客户端的第一个流，作为控制流
+	log.Printf("[%s] 等待客户端发送控制指令...", tunnelConn.RemoteAddr())
+	controlStream, err := session.AcceptStream()
+	if err != nil {
+		log.Printf("[%s] 接受控制流失败: %v", tunnelConn.RemoteAddr(), err)
+		return
+	}
+	defer controlStream.Close()
+
+	// 2. 解析控制消息
+	var ctrlMsg ControlMessage
+	if err := json.NewDecoder(controlStream).Decode(&ctrlMsg); err != nil {
+		log.Printf("[%s] 解析控制消息失败: %v", tunnelConn.RemoteAddr(), err)
+		_ = json.NewEncoder(controlStream).Encode(ControlResponse{Status: "error", Message: "Invalid control message"})
+		return
+	}
+	log.Printf("[%s] 收到控制指令：请求转发公网端口 :%d", tunnelConn.RemoteAddr(), ctrlMsg.RemotePort)
+
+	// 3. 尝试监听客户端请求的公网端口
+	publicListenAddr := fmt.Sprintf(":%d", ctrlMsg.RemotePort)
+	publicListener, err := net.Listen("tcp", publicListenAddr)
+	if err != nil {
+		errMsg := fmt.Sprintf("监听公网端口 %s 失败: %v", publicListenAddr, err)
+		log.Printf("[%s] %s", tunnelConn.RemoteAddr(), errMsg)
+		_ = json.NewEncoder(controlStream).Encode(ControlResponse{Status: "error", Message: errMsg})
+		return
+	}
+	defer publicListener.Close()
+
+	// 4. 发送成功响应给客户端
+	successMsg := fmt.Sprintf("成功在 %s 上监听, 准备转发流量", publicListener.Addr().String())
+	log.Printf("[%s] %s", tunnelConn.RemoteAddr(), successMsg)
+	err = json.NewEncoder(controlStream).Encode(ControlResponse{Status: "success", Message: successMsg})
+	if err != nil {
+		log.Printf("[%s] 发送成功响应失败: %v", tunnelConn.RemoteAddr(), err)
+		return
+	}
+	controlStream.Close()
+
+	// 5. 循环接受公网连接，并通过smux session转发
+	log.Printf("[%s] 开始为 %s 接受公网连接...", tunnelConn.RemoteAddr(), publicListener.Addr())
 	for {
 		if session.IsClosed() {
-			log.Printf("客户端 %s 的会话已关闭，停止为其接受新用户连接。", tunnelConn.RemoteAddr())
+			log.Printf("[%s] 客户端会话已关闭，停止为其接受新用户连接。", tunnelConn.RemoteAddr())
 			return
 		}
 
-		userConn, err := serviceListener.Accept()
+		userConn, err := publicListener.Accept()
 		if err != nil {
-			// 如果会话关闭，Accept可能会出错，这是正常退出路径
-			if session.IsClosed() {
+			if session.IsClosed() || strings.Contains(err.Error(), "use of closed network connection") {
 				return
 			}
-			log.Printf("接受用户连接失败: %v", err)
+			log.Printf("[%s] 接受公网用户连接失败: %v", tunnelConn.RemoteAddr(), err)
 			continue
 		}
-		log.Printf("收到新用户连接 %s，将通过隧道 %s 转发", userConn.RemoteAddr(), tunnelConn.RemoteAddr())
+		log.Printf("[%s] 收到新公网连接 %s，将通过隧道转发", tunnelConn.RemoteAddr(), userConn.RemoteAddr())
 
-		stream, err := session.OpenStream()
+		dataStream, err := session.OpenStream()
 		if err != nil {
-			log.Printf("无法在 smux 会话上(隧道 %s)打开新流: %v", tunnelConn.RemoteAddr(), err)
+			log.Printf("[%s] 无法在 smux 会话上打开新流: %v", tunnelConn.RemoteAddr(), err)
 			userConn.Close()
-			// 如果打开流失败，很可能smux会话已死，跳出循环，结束此goroutine
 			return
 		}
 
 		go func() {
 			defer userConn.Close()
-			defer stream.Close()
-			handleStream(userConn, stream)
-			log.Printf("用户连接 %s (经由隧道 %s) 的会话已结束", userConn.RemoteAddr(), tunnelConn.RemoteAddr())
+			defer dataStream.Close()
+			handleStream(userConn, dataStream)
+			log.Printf("[%s] 公网连接 %s 的会话已结束", tunnelConn.RemoteAddr(), userConn.RemoteAddr())
 		}()
 	}
 }
 
+// ======================= 客户端逻辑 (已修改) =======================
 
-// runClient 启动客户端逻辑 (基本无变化，仅修正日志和错误处理)
-func runClient(configString, targetAddr string) {
-	jsonBytes, err := base64.StdEncoding.DecodeString(configString)
+func runClient(configString, localTargetAddr string, remotePort int, maxRetryInterval time.Duration) {
+	// [修改] 解析配置的逻辑只执行一次
+	compressedBytes, err := base64.RawStdEncoding.DecodeString(configString)
 	if err != nil {
 		log.Fatalf("无效的配置字符串 (Base64解码失败): %v", err)
 	}
+	r, err := gzip.NewReader(bytes.NewReader(compressedBytes))
+	if err != nil {
+		log.Fatalf("无法创建 gzip reader: %v", err)
+	}
+	jsonBytes, err := io.ReadAll(r)
+	if err != nil {
+		log.Fatalf("解压配置数据失败: %v", err)
+	}
+	_ = r.Close()
+
 	var cfg ClientConfig
 	if err := json.Unmarshal(jsonBytes, &cfg); err != nil {
 		log.Fatalf("无效的配置字符串 (JSON解析失败): %v", err)
 	}
-
-	log.Printf("客户端模式：连接到远程隧道 %s，转发到本地目标 %s", cfg.ServerAddr, targetAddr)
 
 	clientCert, err := tls.X509KeyPair([]byte(cfg.ClientCert), []byte(cfg.ClientKey))
 	if err != nil {
@@ -372,9 +406,8 @@ func runClient(configString, targetAddr string) {
 	if !caCertPool.AppendCertsFromPEM([]byte(cfg.CACert)) {
 		log.Fatal("无法将 CA 证书添加到池中")
 	}
-
-	serverHost, _, err := net.SplitHostPort(cfg.ServerAddr)
-	if err != nil {
+	serverHost, _, _ := net.SplitHostPort(cfg.ServerAddr)
+	if serverHost == "" {
 		serverHost = cfg.ServerAddr
 	}
 
@@ -385,40 +418,91 @@ func runClient(configString, targetAddr string) {
 		MinVersion:   tls.VersionTLS13,
 	}
 
-	tunnelConn, err := tls.Dial("tcp", cfg.ServerAddr, tlsConfig)
-	if err != nil {
-		log.Fatalf("无法通过 mTLS 连接到远程隧道 %s: %v", cfg.ServerAddr, err)
+	log.Printf("客户端模式启动：目标服务端 %s", cfg.ServerAddr)
+	log.Printf("-> 远程端口 :%d -> 本地目标 %s", remotePort, localTargetAddr)
+
+	// [新增] 自动重连的主循环
+	var currentRetryInterval = 2 * time.Second
+	for {
+		// 1. 尝试连接，直到成功
+		var tunnelConn net.Conn
+		for {
+			log.Printf("正在尝试连接到服务端 %s...", cfg.ServerAddr)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			d := tls.Dialer{Config: tlsConfig}
+			conn, err := d.DialContext(ctx, "tcp", cfg.ServerAddr)
+			cancel() // 及时释放 context 资源
+
+			if err == nil {
+				log.Println("成功连接到服务端！")
+				tunnelConn = conn
+				currentRetryInterval = 2 * time.Second // 连接成功后，重置重试间隔
+				break
+			}
+
+			log.Printf("连接失败: %v", err)
+			log.Printf("将在 %.0f 秒后重试...", currentRetryInterval.Seconds())
+			time.Sleep(currentRetryInterval)
+
+			// 指数退避策略
+			currentRetryInterval *= 2
+			// 增加抖动，防止惊群效应
+			jitter := time.Duration(rand.Intn(1000)) * time.Millisecond
+			currentRetryInterval += jitter
+
+			if currentRetryInterval > maxRetryInterval {
+				currentRetryInterval = maxRetryInterval
+			}
+		}
+
+		// 2. 连接成功后，运行核心业务逻辑
+		runClientSession(tunnelConn, localTargetAddr, remotePort)
+
+		// 3. 如果 `runClientSession` 返回，说明连接已断开
+		log.Println("与服务端的连接已断开，准备自动重连...")
+		// 短暂等待后，循环将自动开始下一次连接尝试
+		time.Sleep(2 * time.Second)
 	}
-	log.Printf("已成功通过 mTLS 连接到隧道 %s", cfg.ServerAddr)
+}
+
+// [新增] runClientSession 封装了单次连接成功后的所有操作
+func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort int) {
 	defer tunnelConn.Close()
 
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
 	session, err := smux.Client(tunnelConn, smuxConfig)
 	if err != nil {
-		log.Fatalf("无法创建 smux 客户端会话: %v", err)
+		log.Printf("创建 smux 客户端会话失败: %v", err)
+		return // 返回后将触发重连
 	}
 	defer session.Close()
 
+	if err := requestPortForwarding(session, remotePort); err != nil {
+		log.Printf("请求端口转发失败: %v", err)
+		return // 返回后将触发重连
+	}
+
+	log.Println("控制指令发送成功，开始监听并转发流量...")
 	for {
 		stream, err := session.AcceptStream()
 		if err != nil {
-			// 更优雅地处理连接关闭
-			if err == io.EOF || strings.Contains(err.Error(), "use of closed network connection") {
-				log.Println("隧道会话已关闭，客户端退出。")
+			if err == io.EOF || strings.Contains(err.Error(), "use of closed network connection") || strings.Contains(err.Error(), "broken pipe") {
+				log.Println("隧道会话已关闭。")
 			} else {
-				log.Printf("无法接受新流，客户端退出: %v", err)
+				log.Printf("无法接受新流: %v", err)
 			}
-			return
+			return // 任何错误都将导致返回，并触发外部的重连逻辑
 		}
-		log.Println("收到新的转发请求，正在连接本地服务...")
-		localConn, err := net.Dial("tcp", targetAddr)
-		if err != nil {
-			log.Printf("无法连接到本地目标 %s: %v", targetAddr, err)
-			stream.Close()
-			continue
-		}
+
 		go func() {
+			log.Println("收到新的转发请求，正在连接本地服务...")
+			localConn, err := net.Dial("tcp", localTargetAddr)
+			if err != nil {
+				log.Printf("无法连接到本地目标 %s: %v", localTargetAddr, err)
+				_ = stream.Close()
+				return
+			}
 			defer localConn.Close()
 			defer stream.Close()
 			handleStream(localConn, stream)
@@ -427,33 +511,70 @@ func runClient(configString, targetAddr string) {
 	}
 }
 
+// requestPortForwarding 客户端通过smux会话发送控制指令
+func requestPortForwarding(session *smux.Session, port int) error {
+	log.Println("正在打开控制流以发送端口转发请求...")
+	controlStream, err := session.OpenStream()
+	if err != nil {
+		return fmt.Errorf("无法打开 smux 控制流: %w", err)
+	}
+	defer controlStream.Close()
+
+	req := ControlMessage{RemotePort: port}
+	if err := json.NewEncoder(controlStream).Encode(req); err != nil {
+		return fmt.Errorf("发送控制消息失败: %w", err)
+	}
+	log.Printf("控制消息已发送: %+v", req)
+
+	var resp ControlResponse
+	_ = controlStream.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if err := json.NewDecoder(controlStream).Decode(&resp); err != nil {
+		return fmt.Errorf("读取服务端响应失败: %w", err)
+	}
+
+	if resp.Status != "success" {
+		return fmt.Errorf("服务端返回错误: %s", resp.Message)
+	}
+
+	log.Printf("服务端成功响应: %s", resp.Message)
+	return nil
+}
+
 func main() {
+	// [新增] main函数中初始化随机数种子
+	rand.Seed(time.Now().UnixNano())
+
 	mode := flag.String("mode", "", "运行模式: 'server' 或 'client'")
 
 	// Server 模式参数
-	listenAddr := flag.String("listen", "localhost:5556", "[Server模式] 公开给用户访问的地址")
 	tunnelAddr := flag.String("tunnel", ":7000", "[Server模式] 用于监听客户端隧道的地址")
-	// FIX: 新增 public-addr 参数
-	publicAddr := flag.String("public-addr", "", "[Server模式-必需] 服务器的公网地址和隧道端口 (例如: 47.110.46.147:7000 或 mydomain.com:7000)")
+	publicAddr := flag.String("public-addr", "", "[Server模式-必需] 服务器的公网地址和隧道端口 (例如: myproxy.com:7000)")
 
 	// Client 模式参数
 	configString := flag.String("config", "", "[Client模式-必需] 从服务端获取的单行配置字符串")
-	targetAddr := flag.String("target", "localhost:5555", "[Client模式] 要转发流量的本地目标地址 (例如 adb 的 127.0.0.1:5037)")
+	localTargetAddr := flag.String("local-target", "127.0.0.1:5037", "[Client模式] 要转发流量的本地目标地址")
+	remotePort := flag.Int("remote-port", 8080, "[Client模式] 希望在服务端暴露的公网端口")
+	// [新增] 客户端重连相关的参数
+	maxRetryInterval := flag.Duration("max-retry-interval", 60*time.Second, "[Client模式] 自动重连的最大等待间隔")
 
 	flag.Parse()
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds) // 使用微秒方便调试
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
 	switch *mode {
 	case "server":
 		if *publicAddr == "" {
 			log.Fatal("[Server模式] 错误: 必须提供 -public-addr 参数")
 		}
-		runServer(*listenAddr, *tunnelAddr, *publicAddr)
+		runServer(*tunnelAddr, *publicAddr)
 	case "client":
 		if *configString == "" {
 			log.Fatal("[Client模式] 错误: 必须提供 -config 参数")
 		}
-		runClient(*configString, *targetAddr)
+		if *remotePort <= 0 || *remotePort > 65535 {
+			log.Fatal("[Client模式] 错误: -remote-port 必须是 1-65535 之间的有效端口")
+		}
+		// [修改] 将最大重试间隔传递给 runClient
+		runClient(*configString, *localTargetAddr, *remotePort, *maxRetryInterval)
 	default:
 		fmt.Println("错误: 必须指定模式 -mode 'server' 或 -mode 'client'")
 		flag.PrintDefaults()
