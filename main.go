@@ -146,7 +146,7 @@ func generateAllCerts(tunnelAddr string) error {
 	if err != nil {
 		return fmt.Errorf("创建服务器证书失败: %w", err)
 	}
-	if err := savePEM(filepath.Join(certDir, serverCertFile), filepath.Join(certDir, serverKeyFile), serverCert, caKey); err != nil {
+    if err := savePEM(filepath.Join(certDir, serverCertFile), filepath.Join(certDir, serverKeyFile), serverCert, serverKey); err != nil {
 		return err
 	}
 
@@ -278,7 +278,7 @@ func runServer(listenAddr, tunnelAddr string) {
 		log.Fatalf("无法监听服务地址 %s: %v", listenAddr, err)
 	}
 	defer serviceListener.Close()
-	log.Printf("服务已就绪")
+	log.Printf("服务已就绪，请在公网服务器上使用 'adb connect %s'", listenAddr)
 
 	// 5. 循环接受外部工具的连接 (无变化)
 	for {
@@ -326,7 +326,7 @@ func runClient(configString, targetAddr string) {
 	if !caCertPool.AppendCertsFromPEM([]byte(cfg.CACert)) {
 		log.Fatal("无法将 CA 证书添加到池中")
 	}
-	
+
 	// 从服务器地址中提取主机名用于 ServerName
 	serverHost, _, err := net.SplitHostPort(cfg.ServerAddr)
 	if err != nil {
