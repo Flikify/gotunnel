@@ -26,7 +26,7 @@ jobs:
 
       - uses: wangyoucao577/go-release-action@v1.51 # 建议用较新版本
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_token: ${{ secrets.GH_TOEKN }}
           goos: ${{ matrix.goos }}
           goarch: ${{ matrix.goarch }}
           goversion: 1.24.3
