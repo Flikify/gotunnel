@@ -2,24 +2,34 @@ name: build-go-binary
 
 on:
   release:
-    types: [created] # 表示在创建新的 Release 时触发
+    types: [published] # 更推荐
 
 jobs:
   build-go-binary:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        goos: [linux, windows, darwin] # 需要打包的系统
-        goarch: [amd64, arm64] # 需要打包的架构
-        exclude: # 排除某些平台和架构
+        goos: [linux, windows, darwin]
+        goarch: [amd64, arm64]
+        exclude:
           - goarch: arm64
             goos: windows
     steps:
-      - uses: actions/checkout@v3
-      - uses: wangyoucao577/go-release-action@v1.30
+      - uses: actions/checkout@v4
+
+      - name: Check go.mod exists
+        run: |
+          if [ ! -f go.mod ]; then
+            echo "::error::go.mod not found! Run 'go mod init' in your repo root and commit it."
+            exit 1
+          fi
+
+      - uses: wangyoucao577/go-release-action@v1.51 # 建议用较新版本
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }} # 一个默认的变量，用来实现往 Release 中添加文件
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           goos: ${{ matrix.goos }}
           goarch: ${{ matrix.goarch }}
-          goversion: 1.24.3 # 可以指定编译使用的 Golang 版本
-          binary_name: "secure-proxy" # 可以指定二进制文件的名称
+          goversion: 1.24.3
+          binary_name: "secure-proxy"
+          # 下面参数仅当 main.go 不在仓库根目录时使用
+          # main_package_path: ./cmd/proxy
