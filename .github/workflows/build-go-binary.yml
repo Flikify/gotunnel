@@ -3,7 +3,6 @@ name: build-go-binary
 on:
   release:
     types:
-      - published
       - created
 
 jobs:
