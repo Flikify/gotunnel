@@ -30,7 +30,6 @@ import (
 	"github.com/xtaci/smux"
 )
 
-// ... (从 const certDir 到 savePEM 函数的代码保持不变，这里省略)
 const (
 	certDir        = "certs"
 	caCertFile     = "ca.crt"
@@ -60,6 +59,68 @@ type ControlResponse struct {
 	Message string `json:"message"`
 }
 
+// ======================= 新增: 本地连接池 =======================
+
+// ConnectionPool 管理到本地目标服务的一组可复用TCP连接
+type ConnectionPool struct {
+	conns      chan net.Conn
+	targetAddr string
+	maxSize    int
+}
+
+// NewConnectionPool 创建一个新的连接池
+// target: 本地目标地址, e.g., "127.0.0.1:5037"
+// size: 池的最大容量
+func NewConnectionPool(target string, size int) (*ConnectionPool, error) {
+	if size <= 0 {
+		return nil, fmt.Errorf("连接池大小必须为正数")
+	}
+	return &ConnectionPool{
+		conns:      make(chan net.Conn, size),
+		targetAddr: target,
+		maxSize:    size,
+	}, nil
+}
+
+// Get 从池中获取一个连接。如果池为空，则创建一个新连接。
+func (p *ConnectionPool) Get() (net.Conn, error) {
+	select {
+	case conn := <-p.conns:
+		// 从池中获取到一个连接
+		log.Println("从连接池获取了一个现有连接。")
+		return conn, nil
+	default:
+		// 池为空，创建一个新连接
+		log.Println("连接池为空，正在创建新连接...")
+		return net.Dial("tcp", p.targetAddr)
+	}
+}
+
+// Put 将一个连接放回池中。如果池已满，则关闭该连接。
+func (p *ConnectionPool) Put(conn net.Conn) {
+	// 在将连接放回池中之前，可以添加健康检查逻辑，但这里为了简化，我们直接放回。
+	// 如果连接已经损坏，下一个使用者在IO操作时会检测到错误。
+	select {
+	case p.conns <- conn:
+		// 连接成功放回池中
+		log.Println("连接已归还到连接池。")
+	default:
+		// 池已满，关闭此连接
+		log.Println("连接池已满，关闭多余的连接。")
+		_ = conn.Close()
+	}
+}
+
+// Close 关闭池中所有的连接
+func (p *ConnectionPool) Close() {
+	close(p.conns)
+	for conn := range p.conns {
+		_ = conn.Close()
+	}
+}
+
+// ======================= 核心工具函数 =======================
+
 // handleStream 负责在两个连接之间双向拷贝数据，并优雅地处理关闭
 func handleStream(p1, p2 io.ReadWriteCloser) {
 	var wg sync.WaitGroup
@@ -86,6 +147,8 @@ func handleStream(p1, p2 io.ReadWriteCloser) {
 	}()
 	wg.Wait()
 }
+
+// ======================= 证书管理 (未修改) =======================
 
 // generateAndLoadCertificates 负责生成（如果需要）并加载所有证书
 func generateAndLoadCertificates(publicAddr string) (*tls.Config, string, error) {
@@ -256,8 +319,8 @@ func savePEM(certPath, keyPath string, cert *x509.Certificate, key *ecdsa.Privat
 }
 
 // ======================= 服务端逻辑 (未修改) =======================
+
 func runServer(tunnelAddr, publicAddr string) {
-	// ... 这部分代码保持不变 ...
 	log.Printf("服务端模式：隧道监听于 %s, 公网地址为 %s", tunnelAddr, publicAddr)
 
 	tlsConfig, clientConfigString, err := generateAndLoadCertificates(publicAddr)
@@ -289,7 +352,6 @@ func runServer(tunnelAddr, publicAddr string) {
 }
 
 func handleClientSession(tunnelConn net.Conn) {
-	// ... 这部分代码保持不变 ...
 	log.Printf("客户端 %s 已通过 mTLS 验证并连接隧道", tunnelConn.RemoteAddr())
 	defer tunnelConn.Close()
 
@@ -339,7 +401,7 @@ func handleClientSession(tunnelConn net.Conn) {
 		log.Printf("[%s] 发送成功响应失败: %v", tunnelConn.RemoteAddr(), err)
 		return
 	}
-	controlStream.Close()
+	_ = controlStream.Close()
 
 	// 5. 循环接受公网连接，并通过smux session转发
 	log.Printf("[%s] 开始为 %s 接受公网连接...", tunnelConn.RemoteAddr(), publicListener.Addr())
@@ -362,7 +424,7 @@ func handleClientSession(tunnelConn net.Conn) {
 		dataStream, err := session.OpenStream()
 		if err != nil {
 			log.Printf("[%s] 无法在 smux 会话上打开新流: %v", tunnelConn.RemoteAddr(), err)
-			userConn.Close()
+			_ = userConn.Close()
 			return
 		}
 
@@ -375,10 +437,10 @@ func handleClientSession(tunnelConn net.Conn) {
 	}
 }
 
-// ======================= 客户端逻辑 (已修改) =======================
+// ======================= 客户端逻辑 (已优化) =======================
 
 func runClient(configString, localTargetAddr string, remotePort int, maxRetryInterval time.Duration) {
-	// [修改] 解析配置的逻辑只执行一次
+	// 解析配置的逻辑只执行一次
 	compressedBytes, err := base64.RawStdEncoding.DecodeString(configString)
 	if err != nil {
 		log.Fatalf("无效的配置字符串 (Base64解码失败): %v", err)
@@ -421,7 +483,7 @@ func runClient(configString, localTargetAddr string, remotePort int, maxRetryInt
 	log.Printf("客户端模式启动：目标服务端 %s", cfg.ServerAddr)
 	log.Printf("-> 远程端口 :%d -> 本地目标 %s", remotePort, localTargetAddr)
 
-	// [新增] 自动重连的主循环
+	// 自动重连的主循环
 	var currentRetryInterval = 2 * time.Second
 	for {
 		// 1. 尝试连接，直到成功
@@ -465,7 +527,7 @@ func runClient(configString, localTargetAddr string, remotePort int, maxRetryInt
 	}
 }
 
-// [新增] runClientSession 封装了单次连接成功后的所有操作
+// [修改] runClientSession 封装了单次连接成功后的所有操作，并使用连接池
 func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort int) {
 	defer tunnelConn.Close()
 
@@ -477,6 +539,16 @@ func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort in
 		return // 返回后将触发重连
 	}
 	defer session.Close()
+
+	// [新增] 创建到本地服务的连接池
+	// 池的大小可以根据预期并发量调整，这里设为10作为示例
+	const poolSize = 10
+	localConnPool, err := NewConnectionPool(localTargetAddr, poolSize)
+	if err != nil {
+		log.Printf("创建本地连接池失败: %v", err)
+		return
+	}
+	defer localConnPool.Close() // 当整个会话结束时，关闭所有池中连接
 
 	if err := requestPortForwarding(session, remotePort); err != nil {
 		log.Printf("请求端口转发失败: %v", err)
@@ -496,15 +568,18 @@ func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort in
 		}
 
 		go func() {
-			log.Println("收到新的转发请求，正在连接本地服务...")
-			localConn, err := net.Dial("tcp", localTargetAddr)
+			defer stream.Close()
+			log.Println("收到新的转发请求，正在从连接池获取本地连接...")
+
+			// [修改] 从连接池获取连接，而不是每次都Dial
+			localConn, err := localConnPool.Get()
 			if err != nil {
-				log.Printf("无法连接到本地目标 %s: %v", localTargetAddr, err)
-				_ = stream.Close()
+				log.Printf("无法从连接池获取/创建到本地目标的连接 %s: %v", localTargetAddr, err)
 				return
 			}
-			defer localConn.Close()
-			defer stream.Close()
+			// [修改] 使用完毕后，将连接放回池中，而不是关闭它
+			defer localConnPool.Put(localConn)
+
 			handleStream(localConn, stream)
 			log.Println("本地转发会话已结束")
 		}()
@@ -540,8 +615,9 @@ func requestPortForwarding(session *smux.Session, port int) error {
 	return nil
 }
 
+// ======================= 主函数 (未修改) =======================
+
 func main() {
-	// [新增] main函数中初始化随机数种子
 	rand.Seed(time.Now().UnixNano())
 
 	mode := flag.String("mode", "", "运行模式: 'server' 或 'client'")
@@ -554,7 +630,6 @@ func main() {
 	configString := flag.String("config", "", "[Client模式-必需] 从服务端获取的单行配置字符串")
 	localTargetAddr := flag.String("local-target", "127.0.0.1:5037", "[Client模式] 要转发流量的本地目标地址")
 	remotePort := flag.Int("remote-port", 8080, "[Client模式] 希望在服务端暴露的公网端口")
-	// [新增] 客户端重连相关的参数
 	maxRetryInterval := flag.Duration("max-retry-interval", 60*time.Second, "[Client模式] 自动重连的最大等待间隔")
 
 	flag.Parse()
@@ -573,10 +648,10 @@ func main() {
 		if *remotePort <= 0 || *remotePort > 65535 {
 			log.Fatal("[Client模式] 错误: -remote-port 必须是 1-65535 之间的有效端口")
 		}
-		// [修改] 将最大重试间隔传递给 runClient
 		runClient(*configString, *localTargetAddr, *remotePort, *maxRetryInterval)
 	default:
 		fmt.Println("错误: 必须指定模式 -mode 'server' 或 -mode 'client'")
 		flag.PrintDefaults()
 	}
 }
+
