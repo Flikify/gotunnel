@@ -1,3 +1,4 @@
+// filename: gotunnel.go
 package main
 
 import (
@@ -27,17 +28,17 @@ import (
 	"github.com/xtaci/smux"
 )
 
-// ========= 证书管理相关常量 (MODIFIED) =========
+// ========= 证书管理相关常量 =========
 const (
 	certDir          = "certs"
 	caCertFile       = "ca.crt"
-	caKeyFile      = "ca.key"
+	caKeyFile        = "ca.key"
 	serverCertFile   = "server.crt"
 	serverKeyFile    = "server.key"
-	internalCertName = "gotunnel.internal" // NEW: 用于证书的内部固定主机名
+	internalCertName = "gotunnel.internal" // 用于证书的内部固定主机名
 )
 
-// ControlMessage 和 ControlResponse 结构体 (未修改)
+// ControlMessage 和 ControlResponse 结构体
 type ControlMessage struct {
 	RemotePort int `json:"remote_port"`
 }
@@ -46,12 +47,13 @@ type ControlResponse struct {
 	Message string `json:"message"`
 }
 
-// ConnectionPool (未修改)
+// ConnectionPool
 type ConnectionPool struct {
 	conns      chan net.Conn
 	targetAddr string
 	maxSize    int
 }
+
 func NewConnectionPool(target string, size int) (*ConnectionPool, error) {
 	if size <= 0 {
 		return nil, fmt.Errorf("连接池大小必须为正数")
@@ -84,7 +86,7 @@ func (p *ConnectionPool) Close() {
 	}
 }
 
-// handleStream (未修改)
+// handleStream
 func handleStream(p1, p2 io.ReadWriteCloser) {
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -102,7 +104,7 @@ func handleStream(p1, p2 io.ReadWriteCloser) {
 }
 
 
-// ======================= PSK 认证逻辑 (未修改) =======================
+// ======================= PSK 认证逻辑 =======================
 const pskAuthTimeout = 5 * time.Second
 
 func authenticateClient(conn net.Conn, expectedSecret string) error {
@@ -140,13 +142,12 @@ func authenticateWithServer(conn net.Conn, secret string) error {
 	return nil
 }
 
-// ======================= 服务端逻辑 (MODIFIED) =======================
+// ======================= 服务端逻辑 =======================
 
 func runServer(listenAddr, secret string) {
 	log.Printf("服务端模式：隧道监听于 %s", listenAddr)
 
-	// MODIFIED: 不再需要 publicHost，直接使用内部固定名称生成证书
-	tlsConfig, caCertPEM, err := setupServerTLS()
+	tlsConfig, caCert, err := setupServerTLS()
 	if err != nil {
 		log.Fatalf("初始化 TLS 配置失败: %v", err)
 	}
@@ -157,17 +158,15 @@ func runServer(listenAddr, secret string) {
 	}
 	defer listener.Close()
 
-	// MODIFIED: 更新了启动提示信息
 	fmt.Println("\n======================= SERVER IS RUNNING (SECURE) =======================")
 	fmt.Printf("共享密钥 (Secret): %s\n", secret)
-	fmt.Printf("监听地址 (Listening on): %s\n", listenAddr)
+	fmt.Printf("监听地址 (Listening on): %s\n", listener.Addr().String())
 	fmt.Println("\n请在客户端机器上创建一个 ca.crt 文件, 并将以下内容复制进去:")
-    pemData := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertPEM.Raw})
-    fmt.Print(string(pemData)) // 使用 fmt.Print 避免末尾多一个换行符
-	fmt.Println("\n然后使用类似如下命令连接 (请将 <server_ip> 替换为服务器的真实公网IP):")
-	fmt.Printf("./gotunnel client -server <server_ip>%s -secret \"%s\" -ca ./ca.crt -remote-port 8080 -local-target 127.0.0.1:80\n", listenAddr, secret)
+	pemData := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCert.Raw})
+	fmt.Print(string(pemData)) // 使用 fmt.Print 避免末尾多一个换行符
+	fmt.Println("\n然后使用类似如下命令连接 (请将 <server_ip> 和 <listen_port> 替换为实际值):")
+	fmt.Printf("./gotunnel client -server <server_ip>:%s -secret \"%s\" -ca ./ca.crt -remote-port 8080 -local-target 127.0.0.1:80\n", strings.TrimPrefix(listenAddr, ":"), secret)
 	fmt.Println("==========================================================================")
-
 
 	for {
 		conn, err := listener.Accept()
@@ -189,7 +188,7 @@ func runServer(listenAddr, secret string) {
 	}
 }
 
-// handleClientSession (FIXED: Uses polling to correctly handle public listener cleanup)
+// handleClientSession (FIXED: 使用轮询正确处理公共监听器的清理)
 func handleClientSession(tunnelConn net.Conn) {
 	defer tunnelConn.Close()
 
@@ -229,26 +228,20 @@ func handleClientSession(tunnelConn net.Conn) {
 		return
 	}
 
-	// =========================== 核心修复逻辑 (V2) ===========================
-	// 启动一个 "watcher" goroutine。
-	// 由于 smux.Session 没有提供 Context 或 Done channel，我们采用轮询的方式。
-	// 这个 goroutine 会定期检查会话是否已关闭。
+	// 核心修复逻辑：启动一个 "watcher" goroutine。
+	// 它定期检查 smux 会话是否已关闭，如果是，则关闭公共监听器以释放端口。
 	go func() {
-		// 使用 Ticker 进行定期检查，比 time.Sleep 更为精确和高效。
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 
 		for range ticker.C {
 			if session.IsClosed() {
 				log.Printf("[%s] 检测到 smux 会话已关闭，正在关闭公网监听器 %s", tunnelConn.RemoteAddr(), publicListener.Addr())
-				// 这会使得下面循环中阻塞的 publicListener.Accept() 调用立即失败并返回一个错误，
-				// 从而让主 goroutine 从循环中退出。
 				publicListener.Close()
 				return // 结束这个 watcher goroutine
 			}
 		}
 	}()
-	// =======================================================================
 
 	successMsg := fmt.Sprintf("成功在 %s 上监听, 准备转发流量", publicListener.Addr().String())
 	log.Printf("[%s] %s", tunnelConn.RemoteAddr(), successMsg)
@@ -265,13 +258,11 @@ func handleClientSession(tunnelConn net.Conn) {
 		userConn, err := publicListener.Accept()
 		if err != nil {
 			// 当 watcher 调用 publicListener.Close() 后，Accept会返回一个错误。
-			// 这就是我们期望的退出路径。
+			// 这是我们期望的退出路径。
 			log.Printf("[%s] 公网监听器已关闭或遇到错误，停止接受新连接。原因: %v", tunnelConn.RemoteAddr(), err)
 			return // 正常退出循环
 		}
 
-		// 在接受连接后，再次检查会话是否已经关闭，以处理竞态条件。
-		// (即在Accept返回和OpenStream调用之间，会话关闭了)
 		if session.IsClosed() {
 			log.Printf("[%s] 会话已关闭，拒绝新的公网连接 %s", tunnelConn.RemoteAddr(), userConn.RemoteAddr())
 			userConn.Close()
@@ -284,7 +275,6 @@ func handleClientSession(tunnelConn net.Conn) {
 		if err != nil {
 			log.Printf("[%s] 无法在 smux 会话上打开新流: %v", tunnelConn.RemoteAddr(), err)
 			_ = userConn.Close()
-			// 如果无法打开流，很可能是会话快要关闭了，我们直接退出循环
 			return
 		}
 
@@ -298,13 +288,12 @@ func handleClientSession(tunnelConn net.Conn) {
 }
 
 
-// ======================= 客户端逻辑 (MODIFIED) =======================
+// ======================= 客户端逻辑 =======================
 
 func runClient(serverAddr, secret, localTargetAddr, caCertPath string, remotePort int, maxRetryInterval time.Duration) {
 	log.Printf("客户端模式启动：目标服务端 %s (安全)", serverAddr)
 	log.Printf("-> 远程端口 :%d -> 本地目标 %s", remotePort, localTargetAddr)
 
-	// MODIFIED: setupClientTLS 不再需要 serverAddr，因为 ServerName 是固定的
 	tlsConfig, err := setupClientTLS(caCertPath)
 	if err != nil {
 		log.Fatalf("初始化客户端 TLS 配置失败: %v", err)
@@ -331,7 +320,7 @@ func runClient(serverAddr, secret, localTargetAddr, caCertPath string, remotePor
 				} else {
 					log.Println("PSK 认证成功！隧道已建立。")
 					tunnelConn = conn
-					currentRetryInterval = 2 * time.Second
+					currentRetryInterval = 2 * time.Second // Reset retry interval on success
 					break
 				}
 			}
@@ -354,7 +343,6 @@ func runClient(serverAddr, secret, localTargetAddr, caCertPath string, remotePor
 }
 
 
-// runClientSession (和之前版本一致，无需修改)
 func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort int) {
 	defer tunnelConn.Close()
 
@@ -409,7 +397,6 @@ func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort in
 }
 
 
-// requestPortForwarding (和之前版本一致，无需修改)
 func requestPortForwarding(session *smux.Session, port int) error {
 	log.Println("正在打开控制流以发送端口转发请求...")
 	controlStream, err := session.OpenStream()
@@ -438,9 +425,8 @@ func requestPortForwarding(session *smux.Session, port int) error {
 }
 
 
-// ======================= TLS 和 证书管理 (MODIFIED) =======================
+// ======================= TLS 和 证书管理 =======================
 
-// MODIFIED: setupClientTLS now uses the hardcoded internal cert name for validation
 func setupClientTLS(caCertPath string) (*tls.Config, error) {
 	caCertPEM, err := os.ReadFile(caCertPath)
 	if err != nil {
@@ -453,12 +439,11 @@ func setupClientTLS(caCertPath string) (*tls.Config, error) {
 
 	return &tls.Config{
 		RootCAs:    caCertPool,
-		ServerName: internalCertName, // MODIFIED: 关键！验证服务端证书的固定名称
+		ServerName: internalCertName, // 关键！验证服务端证书的固定名称
 		MinVersion: tls.VersionTLS12,
 	}, nil
 }
 
-// MODIFIED: setupServerTLS no longer needs publicHost
 func setupServerTLS() (*tls.Config, *x509.Certificate, error) {
 	if _, err := os.Stat(certDir); os.IsNotExist(err) {
 		if err := os.Mkdir(certDir, 0700); err != nil {
@@ -473,7 +458,6 @@ func setupServerTLS() (*tls.Config, *x509.Certificate, error) {
 	if _, err := os.Stat(caCertPath); os.IsNotExist(err) {
 		log.Println("未找到 CA 证书，将生成新的 CA 和服务器证书...")
 		var errGen error
-		// MODIFIED: 传入固定的内部名称来生成证书
 		caCert, errGen = generateAndSaveCerts(internalCertName)
 		if errGen != nil {
 			return nil, nil, fmt.Errorf("生成证书失败: %w", errGen)
@@ -486,6 +470,9 @@ func setupServerTLS() (*tls.Config, *x509.Certificate, error) {
 			return nil, nil, fmt.Errorf("读取 CA 证书失败: %w", errRead)
 		}
 		caBlock, _ := pem.Decode(caCertBytes)
+		if caBlock == nil {
+			return nil, nil, fmt.Errorf("无法解码 CA 证书 PEM: %s", caCertPath)
+		}
 		caCert, errRead = x509.ParseCertificate(caBlock.Bytes)
 		if errRead != nil {
 			return nil, nil, fmt.Errorf("解析 CA 证书失败: %w", errRead)
@@ -504,7 +491,6 @@ func setupServerTLS() (*tls.Config, *x509.Certificate, error) {
 }
 
 
-// FIXED: This function is now correct.
 func generateAndSaveCerts(hostNameForCert string) (*x509.Certificate, error) {
 	// 1. 创建 CA
 	caKey, caCert, err := createCertificate(nil, nil, true, "GoTunnel CA", nil, nil)
@@ -535,8 +521,6 @@ func generateAndSaveCerts(hostNameForCert string) (*x509.Certificate, error) {
 	return caCert, nil
 }
 
-
-// createCertificate 和 savePEM (和之前版本一致，无需修改)
 func createCertificate(parent *x509.Certificate, parentKey *ecdsa.PrivateKey, isCA bool, commonName string, ips []net.IP, dnsNames []string) (*ecdsa.PrivateKey, *x509.Certificate, error) {
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
 	if err != nil { return nil, nil, err }
@@ -583,12 +567,11 @@ func savePEM(certPath, keyPath string, cert *x509.Certificate, key *ecdsa.Privat
 }
 
 
-// ======================= 主函数 (FIXED: 采用标准的子命令模式) =======================
+// ======================= 主函数 =======================
 func main() {
-	_, _ = rand.Read(make([]byte, 1))
+	_, _ = rand.Read(make([]byte, 1)) // 确保随机数种子被初始化
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	// 检查参数数量是否足够，至少需要一个子命令
 	if len(os.Args) < 2 {
 		fmt.Println("错误: 必须提供一个运行模式作为子命令 ('server' 或 'client')")
 		fmt.Println("\n使用 'gotunnel server -h' 查看服务端帮助")
@@ -614,19 +597,16 @@ func main() {
 	// --- 根据第一个参数（子命令）来决定做什么 ---
 	switch os.Args[1] {
 	case "server":
-		// 解析从第二个参数开始的所有参数
 		serverFlags.Parse(os.Args[2:])
 		if *sSecret == "" {
 			log.Println("错误: [Server模式] 必须提供 -secret 参数")
 			serverFlags.PrintDefaults()
 			os.Exit(1)
 		}
-		// 格式化监听地址
 		listenAddr := ":" + *sListenPort
 		runServer(listenAddr, *sSecret)
 
 	case "client":
-		// 解析从第二个参数开始的所有参数
 		clientFlags.Parse(os.Args[2:])
 		if *cSecret == "" || *cServerAddr == "" {
 			log.Println("错误: [Client模式] 必须提供 -secret 和 -server 参数")
@@ -642,3 +622,4 @@ func main() {
 		os.Exit(1)
 	}
 }
+
