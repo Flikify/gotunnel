@@ -207,7 +207,6 @@ func handleClientSession(tunnelConn net.Conn) {
 		log.Printf("[%s] 接受控制流失败: %v", tunnelConn.RemoteAddr(), err)
 		return
 	}
-	// 注意：控制流不再需要defer close，因为它在成功响应后会被主动关闭
 
 	var ctrlMsg ControlMessage
 	if err := json.NewDecoder(controlStream).Decode(&ctrlMsg); err != nil {
@@ -228,8 +227,6 @@ func handleClientSession(tunnelConn net.Conn) {
 		return
 	}
 
-	// 核心修复逻辑：启动一个 "watcher" goroutine。
-	// 它定期检查 smux 会话是否已关闭，如果是，则关闭公共监听器以释放端口。
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
@@ -238,7 +235,7 @@ func handleClientSession(tunnelConn net.Conn) {
 			if session.IsClosed() {
 				log.Printf("[%s] 检测到 smux 会话已关闭，正在关闭公网监听器 %s", tunnelConn.RemoteAddr(), publicListener.Addr())
 				publicListener.Close()
-				return // 结束这个 watcher goroutine
+				return
 			}
 		}
 	}()
@@ -246,10 +243,10 @@ func handleClientSession(tunnelConn net.Conn) {
 	successMsg := fmt.Sprintf("成功在 %s 上监听, 准备转发流量", publicListener.Addr().String())
 	log.Printf("[%s] %s", tunnelConn.RemoteAddr(), successMsg)
 	err = json.NewEncoder(controlStream).Encode(ControlResponse{Status: "success", Message: successMsg})
-	controlStream.Close() // 发送完响应后，主动关闭控制流
+	controlStream.Close()
 	if err != nil {
 		log.Printf("[%s] 发送成功响应失败: %v", tunnelConn.RemoteAddr(), err)
-		publicListener.Close() // 同样需要确保监听器被关闭
+		publicListener.Close()
 		return
 	}
 
@@ -257,10 +254,8 @@ func handleClientSession(tunnelConn net.Conn) {
 	for {
 		userConn, err := publicListener.Accept()
 		if err != nil {
-			// 当 watcher 调用 publicListener.Close() 后，Accept会返回一个错误。
-			// 这是我们期望的退出路径。
 			log.Printf("[%s] 公网监听器已关闭或遇到错误，停止接受新连接。原因: %v", tunnelConn.RemoteAddr(), err)
-			return // 正常退出循环
+			return
 		}
 
 		if session.IsClosed() {
@@ -343,6 +338,7 @@ func runClient(serverAddr, secret, localTargetAddr, caCertPath string, remotePor
 }
 
 
+// runClientSession (FIXED: 使用 sync.WaitGroup 等待所有流处理goroutine完成)
 func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort int) {
 	defer tunnelConn.Close()
 
@@ -368,6 +364,9 @@ func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort in
 		return
 	}
 
+	// 1. 创建一个 WaitGroup 用于追踪所有处理流的 goroutine
+	var wg sync.WaitGroup
+
 	log.Println("控制指令发送成功，开始监听并转发流量...")
 	for {
 		stream, err := session.AcceptStream()
@@ -377,11 +376,17 @@ func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort in
 			} else {
 				log.Printf("无法接受新流: %v", err)
 			}
-			return
+			// 循环即将退出
+			break
 		}
-
+		
+		// 2. 每启动一个 goroutine，计数器加一
+		wg.Add(1)
 		go func() {
+			// 3. 当 goroutine 结束时，确保计数器减一
+			defer wg.Done()
 			defer stream.Close()
+			
 			log.Println("收到新的转发请求，正在从连接池获取本地连接...")
 
 			localConn, err := localConnPool.Get()
@@ -389,11 +394,17 @@ func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort in
 				log.Printf("无法从连接池获取/创建到本地目标的连接 %s: %v", localTargetAddr, err)
 				return
 			}
+			// 注意：这里 defer 的顺序很重要，先归还连接，再关闭它
 			defer localConnPool.Put(localConn)
 
 			handleStream(localConn, stream)
 		}()
 	}
+
+	// 4. 在函数返回之前，阻塞并等待所有 goroutine 完成
+	log.Println("等待所有正在处理的流完成...")
+	wg.Wait()
+	log.Println("所有流已处理完毕，正在关闭会话。")
 }
 
 
@@ -426,7 +437,7 @@ func requestPortForwarding(session *smux.Session, port int) error {
 
 
 // ======================= TLS 和 证书管理 =======================
-
+// (该部分代码无需修改，保持原样)
 func setupClientTLS(caCertPath string) (*tls.Config, error) {
 	caCertPEM, err := os.ReadFile(caCertPath)
 	if err != nil {
@@ -439,7 +450,7 @@ func setupClientTLS(caCertPath string) (*tls.Config, error) {
 
 	return &tls.Config{
 		RootCAs:    caCertPool,
-		ServerName: internalCertName, // 关键！验证服务端证书的固定名称
+		ServerName: internalCertName,
 		MinVersion: tls.VersionTLS12,
 	}, nil
 }
@@ -492,7 +503,6 @@ func setupServerTLS() (*tls.Config, *x509.Certificate, error) {
 
 
 func generateAndSaveCerts(hostNameForCert string) (*x509.Certificate, error) {
-	// 1. 创建 CA
 	caKey, caCert, err := createCertificate(nil, nil, true, "GoTunnel CA", nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("创建 CA 失败: %w", err)
@@ -500,8 +510,6 @@ func generateAndSaveCerts(hostNameForCert string) (*x509.Certificate, error) {
 	if err := savePEM(filepath.Join(certDir, caCertFile), filepath.Join(certDir, caKeyFile), caCert, caKey); err != nil {
 		return nil, err
 	}
-
-	// 2. 创建服务器证书
 	var ips []net.IP
 	var dnsNames []string
 	if ip := net.ParseIP(hostNameForCert); ip != nil {
@@ -509,7 +517,6 @@ func generateAndSaveCerts(hostNameForCert string) (*x509.Certificate, error) {
 	} else {
 		dnsNames = append(dnsNames, hostNameForCert)
 	}
-
 	serverKey, serverCert, err := createCertificate(caCert, caKey, false, hostNameForCert, ips, dnsNames)
 	if err != nil {
 		return nil, fmt.Errorf("创建服务器证书失败: %w", err)
@@ -517,7 +524,6 @@ func generateAndSaveCerts(hostNameForCert string) (*x509.Certificate, error) {
 	if err := savePEM(filepath.Join(certDir, serverCertFile), filepath.Join(certDir, serverKeyFile), serverCert, serverKey); err != nil {
 		return nil, err
 	}
-
 	return caCert, nil
 }
 
@@ -557,7 +563,6 @@ func savePEM(certPath, keyPath string, cert *x509.Certificate, key *ecdsa.Privat
 	if err != nil { return err }
 	defer certOut.Close()
 	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}); err != nil { return err }
-
 	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil { return err }
 	defer keyOut.Close()
@@ -568,6 +573,7 @@ func savePEM(certPath, keyPath string, cert *x509.Certificate, key *ecdsa.Privat
 
 
 // ======================= 主函数 =======================
+// (该部分代码无需修改，保持原样)
 func main() {
 	_, _ = rand.Read(make([]byte, 1)) // 确保随机数种子被初始化
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
@@ -579,12 +585,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// --- 定义 Server 模式的 FlagSet ---
 	serverFlags := flag.NewFlagSet("server", flag.ExitOnError)
 	sSecret := serverFlags.String("secret", "", "共享密钥 (必需)")
 	sListenPort := serverFlags.String("listen", "7000", "用于监听客户端隧道的端口")
 
-	// --- 定义 Client 模式的 FlagSet ---
 	clientFlags := flag.NewFlagSet("client", flag.ExitOnError)
 	cSecret := clientFlags.String("secret", "", "共享密钥 (必需)")
 	cServerAddr := clientFlags.String("server", "", "服务端的地址, 例如: my.server.com:7000 (必需)")
@@ -594,7 +598,6 @@ func main() {
 	cMaxRetry := clientFlags.Duration("max-retry-interval", 60*time.Second, "自动重连的最大等待间隔")
 
 
-	// --- 根据第一个参数（子命令）来决定做什么 ---
 	switch os.Args[1] {
 	case "server":
 		serverFlags.Parse(os.Args[2:])
@@ -622,4 +625,3 @@ func main() {
 		os.Exit(1)
 	}
 }
-
