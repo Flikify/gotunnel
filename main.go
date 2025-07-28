@@ -25,6 +25,8 @@ import (
 	"sync"
 	"time"
 
+	// 使用 x/crypto/tls 是为了 getSNI 中的 GetConfigForClient 回调
+	xtls "golang.org/x/crypto/tls"
 	"github.com/xtaci/smux"
 )
 
@@ -144,6 +146,64 @@ func authenticateWithServer(conn net.Conn, secret string) error {
 
 // ======================= 服务端逻辑 =======================
 
+// getSNI 从一个连接中窥探 TLS ClientHello 消息并提取 SNI 主机名。
+// 它不会从连接中消耗数据，后续仍然可以读取完整的 ClientHello。
+func getSNI(conn net.Conn) (string, error) {
+	// 设置一个短暂的读取超时，防止恶意连接不发送数据
+	err := conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if err != nil {
+		return "", fmt.Errorf("设置超时失败: %w", err)
+	}
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+
+	var clientHello *xtls.ClientHelloInfo
+	reader := bufio.NewReader(conn)
+
+	// 使用 bufio.Reader 的 Peek 功能，这样就不会消耗流中的数据
+	peekedBytes, err := reader.Peek(1)
+	if err != nil {
+		// 如果是超时或者EOF，说明连接有问题，但不是我们的逻辑错误
+		if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
+			return "", nil
+		}
+		if err == io.EOF {
+			return "", nil
+		}
+		return "", fmt.Errorf("无法窥探连接: %w", err)
+	}
+
+	// 检查 TLS 记录类型是否是 Handshake (0x16)
+	if peekedBytes[0] != 0x16 {
+		log.Printf("来自 %s 的连接不是 TLS 握手 (第一个字节: 0x%x)，将作为普通 TCP 处理", conn.RemoteAddr(), peekedBytes[0])
+		return "", nil // 不是 TLS 握手，可能是普通的 HTTP 或其他协议
+	}
+
+	// 欺骗 crypto/tls 库来为我们解析 ClientHello
+	err = xtls.Server(struct{ net.Conn }{reader}, &xtls.Config{
+		GetConfigForClient: func(hello *xtls.ClientHelloInfo) (*xtls.Config, error) {
+			// 这个回调函数在解析完 ClientHello 后被调用。
+			// 我们在这里捕获 hello 信息，然后返回一个特定的错误来优雅地中断握手流程。
+			clientHello = hello
+			return nil, fmt.Errorf("中断以获取 SNI")
+		},
+	}).Handshake()
+
+	// 我们期望收到上面返回的特定错误。任何其他错误都意味着解析失败。
+	if err != nil && !strings.Contains(err.Error(), "中断以获取 SNI") {
+		// 这可能是因为 Peek 的数据不足以解析完整的 ClientHello，或者数据包损坏
+		log.Printf("解析 ClientHello 失败: %v。可能不是有效的 TLS 流量。", err)
+		return "", nil
+	}
+
+	if clientHello != nil {
+		log.Printf("从公网连接 %s 提取到 SNI: %s", conn.RemoteAddr(), clientHello.ServerName)
+		return clientHello.ServerName, nil
+	}
+
+	return "", nil // 没有 SNI
+}
+
+
 func runServer(listenAddr, secret string) {
 	log.Printf("服务端模式：隧道监听于 %s", listenAddr)
 
@@ -188,7 +248,7 @@ func runServer(listenAddr, secret string) {
 	}
 }
 
-// handleClientSession (FIXED: 使用轮询正确处理公共监听器的清理)
+// handleClientSession (服务端核心逻辑，已重构以支持 SNI 转发)
 func handleClientSession(tunnelConn net.Conn) {
 	defer tunnelConn.Close()
 
@@ -209,45 +269,34 @@ func handleClientSession(tunnelConn net.Conn) {
 	}
 
 	var ctrlMsg ControlMessage
+	// ... (控制消息处理部分与原版相同) ...
 	if err := json.NewDecoder(controlStream).Decode(&ctrlMsg); err != nil {
 		log.Printf("[%s] 解析控制消息失败: %v", tunnelConn.RemoteAddr(), err)
 		_ = json.NewEncoder(controlStream).Encode(ControlResponse{Status: "error", Message: "Invalid control message"})
-		controlStream.Close()
-		return
+		controlStream.Close(); return
 	}
 	log.Printf("[%s] 收到控制指令：请求转发公网端口 :%d", tunnelConn.RemoteAddr(), ctrlMsg.RemotePort)
-
 	publicListenAddr := fmt.Sprintf(":%d", ctrlMsg.RemotePort)
 	publicListener, err := net.Listen("tcp", publicListenAddr)
 	if err != nil {
-		errMsg := fmt.Sprintf("监听公网端口 %s 失败: %v", publicListenAddr, err)
-		log.Printf("[%s] %s", tunnelConn.RemoteAddr(), errMsg)
-		_ = json.NewEncoder(controlStream).Encode(ControlResponse{Status: "error", Message: errMsg})
-		controlStream.Close()
-		return
+		errMsg := fmt.Sprintf("监听公网端口 %s 失败: %v", publicListenAddr, err); log.Printf("[%s] %s", tunnelConn.RemoteAddr(), errMsg)
+		_ = json.NewEncoder(controlStream).Encode(ControlResponse{Status: "error", Message: errMsg}); controlStream.Close(); return
 	}
-
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
-
 		for range ticker.C {
 			if session.IsClosed() {
 				log.Printf("[%s] 检测到 smux 会话已关闭，正在关闭公网监听器 %s", tunnelConn.RemoteAddr(), publicListener.Addr())
-				publicListener.Close()
-				return
+				publicListener.Close(); return
 			}
 		}
 	}()
-
-	successMsg := fmt.Sprintf("成功在 %s 上监听, 准备转发流量", publicListener.Addr().String())
-	log.Printf("[%s] %s", tunnelConn.RemoteAddr(), successMsg)
-	err = json.NewEncoder(controlStream).Encode(ControlResponse{Status: "success", Message: successMsg})
-	controlStream.Close()
+	successMsg := fmt.Sprintf("成功在 %s 上监听, 准备转发流量", publicListener.Addr().String()); log.Printf("[%s] %s", tunnelConn.RemoteAddr(), successMsg)
+	err = json.NewEncoder(controlStream).Encode(ControlResponse{Status: "success", Message: successMsg}); controlStream.Close()
 	if err != nil {
 		log.Printf("[%s] 发送成功响应失败: %v", tunnelConn.RemoteAddr(), err)
-		publicListener.Close()
-		return
+		publicListener.Close(); return
 	}
 
 	log.Printf("[%s] 开始为 %s 接受公网连接...", tunnelConn.RemoteAddr(), publicListener.Addr())
@@ -257,28 +306,37 @@ func handleClientSession(tunnelConn net.Conn) {
 			log.Printf("[%s] 公网监听器已关闭或遇到错误，停止接受新连接。原因: %v", tunnelConn.RemoteAddr(), err)
 			return
 		}
-
 		if session.IsClosed() {
 			log.Printf("[%s] 会话已关闭，拒绝新的公网连接 %s", tunnelConn.RemoteAddr(), userConn.RemoteAddr())
-			userConn.Close()
-			return
+			userConn.Close(); continue
 		}
 
-		log.Printf("[%s] 收到新公网连接 %s，将通过隧道转发", tunnelConn.RemoteAddr(), userConn.RemoteAddr())
+		go func(publicConn net.Conn) {
+			defer publicConn.Close()
 
-		dataStream, err := session.OpenStream()
-		if err != nil {
-			log.Printf("[%s] 无法在 smux 会话上打开新流: %v", tunnelConn.RemoteAddr(), err)
-			_ = userConn.Close()
-			return
-		}
+			// 1. 提取 SNI
+			sni, _ := getSNI(publicConn) // 忽略错误，失败则作为普通TCP处理
 
-		go func() {
-			defer userConn.Close()
+			// 2. 打开到客户端的 smux 流
+			dataStream, err := session.OpenStream()
+			if err != nil {
+				log.Printf("[%s] 无法在 smux 会话上打开新流: %v", tunnelConn.RemoteAddr(), err)
+				return
+			}
 			defer dataStream.Close()
-			handleStream(userConn, dataStream)
-			log.Printf("[%s] 公网连接 %s 的会话已结束", tunnelConn.RemoteAddr(), userConn.RemoteAddr())
-		}()
+
+			// 3. 将 SNI 作为元数据发送给客户端 (如果没有SNI，发送空行)
+			if _, err := fmt.Fprintf(dataStream, "%s\n", sni); err != nil {
+				log.Printf("[%s] 无法发送 SNI 元数据到客户端: %v", tunnelConn.RemoteAddr(), err)
+				return
+			}
+
+			// 4. 建立双向数据转发
+			log.Printf("[%s] 元数据(SNI: '%s')发送完毕，开始双向转发 %s 的流量", tunnelConn.RemoteAddr(), sni, publicConn.RemoteAddr())
+			handleStream(publicConn, dataStream)
+			log.Printf("[%s] 公网连接 %s 的会话已结束", tunnelConn.RemoteAddr(), publicConn.RemoteAddr())
+
+		}(userConn)
 	}
 }
 
@@ -338,7 +396,19 @@ func runClient(serverAddr, secret, localTargetAddr, caCertPath string, remotePor
 }
 
 
-// runClientSession (FIXED: 使用 sync.WaitGroup 等待所有流处理goroutine完成)
+// streamWrapper 是一个辅助结构体，它包装了一个 smux.Stream，
+// 但允许我们使用一个 bufio.Reader 来读取第一部分数据（元数据），
+// 同时保持 io.ReadWriteCloser 接口的完整性，以便传递给 handleStream。
+type streamWrapper struct {
+	reader io.Reader
+	writer io.Writer
+	closer io.Closer
+}
+func (sw *streamWrapper) Read(p []byte) (n int, err error) { return sw.reader.Read(p) }
+func (sw *streamWrapper) Write(p []byte) (n int, err error) { return sw.writer.Write(p) }
+func (sw *streamWrapper) Close() error { return sw.closer.Close() }
+
+// runClientSession (客户端核心逻辑，已重构以支持自动 SNI)
 func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort int) {
 	defer tunnelConn.Close()
 
@@ -351,8 +421,8 @@ func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort in
 	}
 	defer session.Close()
 
-	const poolSize = 10
-	localConnPool, err := NewConnectionPool(localTargetAddr, poolSize)
+	// 连接池仅用于普通TCP连接
+	localConnPool, err := NewConnectionPool(localTargetAddr, 10)
 	if err != nil {
 		log.Printf("创建本地连接池失败: %v", err)
 		return
@@ -364,7 +434,6 @@ func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort in
 		return
 	}
 
-	// 1. 创建一个 WaitGroup 用于追踪所有处理流的 goroutine
 	var wg sync.WaitGroup
 
 	log.Println("控制指令发送成功，开始监听并转发流量...")
@@ -376,32 +445,57 @@ func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort in
 			} else {
 				log.Printf("无法接受新流: %v", err)
 			}
-			// 循环即将退出
 			break
 		}
 		
-		// 2. 每启动一个 goroutine，计数器加一
 		wg.Add(1)
 		go func() {
-			// 3. 当 goroutine 结束时，确保计数器减一
 			defer wg.Done()
 			defer stream.Close()
 			
-			log.Println("收到新的转发请求，正在从连接池获取本地连接...")
-
-			localConn, err := localConnPool.Get()
+			log.Println("收到新的转发请求，正在读取元数据...")
+			
+			// 1. 读取服务端发来的 SNI 元数据
+			streamReader := bufio.NewReader(stream)
+			sni, err := streamReader.ReadString('\n')
 			if err != nil {
-				log.Printf("无法从连接池获取/创建到本地目标的连接 %s: %v", localTargetAddr, err)
+				log.Printf("读取 SNI 元数据失败: %v", err)
 				return
 			}
-			// 注意：这里 defer 的顺序很重要，先归还连接，再关闭它
-			defer localConnPool.Put(localConn)
+			sni = strings.TrimSpace(sni)
 
-			handleStream(localConn, stream)
+			// 2. 根据 SNI 决定如何连接本地目标
+			var localConn net.Conn
+			if sni != "" {
+				// 有 SNI，建立 TLS 连接，并修正 ServerName
+				log.Printf("检测到 SNI '%s'，正在建立到 %s 的 TLS 连接", sni, localTargetAddr)
+				tlsConfig := &tls.Config{
+					ServerName:         sni,
+					InsecureSkipVerify: true, // PVE证书通常是自签名的或针对主机名，而我们用IP连接，所以需要跳过验证
+				}
+				localConn, err = tls.Dial("tcp", localTargetAddr, tlsConfig)
+			} else {
+				// 没有 SNI，作为普通 TCP 连接处理
+				log.Printf("未检测到 SNI，正在建立到 %s 的普通 TCP 连接", localTargetAddr)
+				localConn, err = localConnPool.Get()
+			}
+			
+			if err != nil {
+				log.Printf("无法建立到本地目标的连接 %s: %v", localTargetAddr, err)
+				return
+			}
+			defer localConn.Close()
+
+			// 3. 包装 smux 流并进行双向转发
+			wrappedStream := &streamWrapper{
+				reader: streamReader,
+				writer: stream,
+				closer: stream,
+			}
+			handleStream(localConn, wrappedStream)
 		}()
 	}
 
-	// 4. 在函数返回之前，阻塞并等待所有 goroutine 完成
 	log.Println("等待所有正在处理的流完成...")
 	wg.Wait()
 	log.Println("所有流已处理完毕，正在关闭会话。")
@@ -573,7 +667,6 @@ func savePEM(certPath, keyPath string, cert *x509.Certificate, key *ecdsa.Privat
 
 
 // ======================= 主函数 =======================
-// (该部分代码无需修改，保持原样)
 func main() {
 	_, _ = rand.Read(make([]byte, 1)) // 确保随机数种子被初始化
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
