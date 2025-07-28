@@ -25,7 +25,7 @@ import (
 	"sync"
 	"time"
 
-	"github.comcom/xtaci/smux"
+	"github.com/xtaci/smux"
 )
 
 // ========= 证书管理相关常量 =========
