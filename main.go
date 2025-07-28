@@ -7,7 +7,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	cryptorand "crypto/rand"
-	"crypto/tls"
+	"crypto/tls" // <-- We only need the standard library TLS
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
@@ -25,8 +25,6 @@ import (
 	"sync"
 	"time"
 
-	// 使用 x/crypto/tls 是为了 getSNI 中的 GetConfigForClient 回调
-	xtls "golang.org/x/crypto/tls"
 	"github.com/xtaci/smux"
 )
 
@@ -156,13 +154,11 @@ func getSNI(conn net.Conn) (string, error) {
 	}
 	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
 
-	var clientHello *xtls.ClientHelloInfo
+	var clientHello *tls.ClientHelloInfo
 	reader := bufio.NewReader(conn)
 
-	// 使用 bufio.Reader 的 Peek 功能，这样就不会消耗流中的数据
 	peekedBytes, err := reader.Peek(1)
 	if err != nil {
-		// 如果是超时或者EOF，说明连接有问题，但不是我们的逻辑错误
 		if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
 			return "", nil
 		}
@@ -172,25 +168,19 @@ func getSNI(conn net.Conn) (string, error) {
 		return "", fmt.Errorf("无法窥探连接: %w", err)
 	}
 
-	// 检查 TLS 记录类型是否是 Handshake (0x16)
 	if peekedBytes[0] != 0x16 {
 		log.Printf("来自 %s 的连接不是 TLS 握手 (第一个字节: 0x%x)，将作为普通 TCP 处理", conn.RemoteAddr(), peekedBytes[0])
 		return "", nil // 不是 TLS 握手，可能是普通的 HTTP 或其他协议
 	}
 
-	// 欺骗 crypto/tls 库来为我们解析 ClientHello
-	err = xtls.Server(struct{ net.Conn }{reader}, &xtls.Config{
-		GetConfigForClient: func(hello *xtls.ClientHelloInfo) (*xtls.Config, error) {
-			// 这个回调函数在解析完 ClientHello 后被调用。
-			// 我们在这里捕获 hello 信息，然后返回一个特定的错误来优雅地中断握手流程。
+	err = tls.Server(struct{ net.Conn }{reader}, &tls.Config{
+		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 			clientHello = hello
 			return nil, fmt.Errorf("中断以获取 SNI")
 		},
 	}).Handshake()
 
-	// 我们期望收到上面返回的特定错误。任何其他错误都意味着解析失败。
 	if err != nil && !strings.Contains(err.Error(), "中断以获取 SNI") {
-		// 这可能是因为 Peek 的数据不足以解析完整的 ClientHello，或者数据包损坏
 		log.Printf("解析 ClientHello 失败: %v。可能不是有效的 TLS 流量。", err)
 		return "", nil
 	}
@@ -223,7 +213,7 @@ func runServer(listenAddr, secret string) {
 	fmt.Printf("监听地址 (Listening on): %s\n", listener.Addr().String())
 	fmt.Println("\n请在客户端机器上创建一个 ca.crt 文件, 并将以下内容复制进去:")
 	pemData := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCert.Raw})
-	fmt.Print(string(pemData)) // 使用 fmt.Print 避免末尾多一个换行符
+	fmt.Print(string(pemData))
 	fmt.Println("\n然后使用类似如下命令连接 (请将 <server_ip> 和 <listen_port> 替换为实际值):")
 	fmt.Printf("./gotunnel client -server <server_ip>:%s -secret \"%s\" -ca ./ca.crt -remote-port 8080 -local-target 127.0.0.1:80\n", strings.TrimPrefix(listenAddr, ":"), secret)
 	fmt.Println("==========================================================================")
@@ -248,7 +238,6 @@ func runServer(listenAddr, secret string) {
 	}
 }
 
-// handleClientSession (服务端核心逻辑，已重构以支持 SNI 转发)
 func handleClientSession(tunnelConn net.Conn) {
 	defer tunnelConn.Close()
 
@@ -269,7 +258,6 @@ func handleClientSession(tunnelConn net.Conn) {
 	}
 
 	var ctrlMsg ControlMessage
-	// ... (控制消息处理部分与原版相同) ...
 	if err := json.NewDecoder(controlStream).Decode(&ctrlMsg); err != nil {
 		log.Printf("[%s] 解析控制消息失败: %v", tunnelConn.RemoteAddr(), err)
 		_ = json.NewEncoder(controlStream).Encode(ControlResponse{Status: "error", Message: "Invalid control message"})
@@ -313,11 +301,7 @@ func handleClientSession(tunnelConn net.Conn) {
 
 		go func(publicConn net.Conn) {
 			defer publicConn.Close()
-
-			// 1. 提取 SNI
-			sni, _ := getSNI(publicConn) // 忽略错误，失败则作为普通TCP处理
-
-			// 2. 打开到客户端的 smux 流
+			sni, _ := getSNI(publicConn)
 			dataStream, err := session.OpenStream()
 			if err != nil {
 				log.Printf("[%s] 无法在 smux 会话上打开新流: %v", tunnelConn.RemoteAddr(), err)
@@ -325,13 +309,10 @@ func handleClientSession(tunnelConn net.Conn) {
 			}
 			defer dataStream.Close()
 
-			// 3. 将 SNI 作为元数据发送给客户端 (如果没有SNI，发送空行)
 			if _, err := fmt.Fprintf(dataStream, "%s\n", sni); err != nil {
 				log.Printf("[%s] 无法发送 SNI 元数据到客户端: %v", tunnelConn.RemoteAddr(), err)
 				return
 			}
-
-			// 4. 建立双向数据转发
 			log.Printf("[%s] 元数据(SNI: '%s')发送完毕，开始双向转发 %s 的流量", tunnelConn.RemoteAddr(), sni, publicConn.RemoteAddr())
 			handleStream(publicConn, dataStream)
 			log.Printf("[%s] 公网连接 %s 的会话已结束", tunnelConn.RemoteAddr(), publicConn.RemoteAddr())
@@ -373,7 +354,7 @@ func runClient(serverAddr, secret, localTargetAddr, caCertPath string, remotePor
 				} else {
 					log.Println("PSK 认证成功！隧道已建立。")
 					tunnelConn = conn
-					currentRetryInterval = 2 * time.Second // Reset retry interval on success
+					currentRetryInterval = 2 * time.Second
 					break
 				}
 			}
@@ -395,20 +376,16 @@ func runClient(serverAddr, secret, localTargetAddr, caCertPath string, remotePor
 	}
 }
 
-
-// streamWrapper 是一个辅助结构体，它包装了一个 smux.Stream，
-// 但允许我们使用一个 bufio.Reader 来读取第一部分数据（元数据），
-// 同时保持 io.ReadWriteCloser 接口的完整性，以便传递给 handleStream。
 type streamWrapper struct {
 	reader io.Reader
 	writer io.Writer
 	closer io.Closer
 }
 func (sw *streamWrapper) Read(p []byte) (n int, err error) { return sw.reader.Read(p) }
-func (sw *streamWrapper) Write(p []byte) (n int, err error) { return sw.writer.Write(p) }
+func (sw *streamWrapper) Write(p []byte) (n int, err error){ return sw.writer.Write(p) }
 func (sw *streamWrapper) Close() error { return sw.closer.Close() }
 
-// runClientSession (客户端核心逻辑，已重构以支持自动 SNI)
+
 func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort int) {
 	defer tunnelConn.Close()
 
@@ -421,7 +398,6 @@ func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort in
 	}
 	defer session.Close()
 
-	// 连接池仅用于普通TCP连接
 	localConnPool, err := NewConnectionPool(localTargetAddr, 10)
 	if err != nil {
 		log.Printf("创建本地连接池失败: %v", err)
@@ -455,7 +431,6 @@ func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort in
 			
 			log.Println("收到新的转发请求，正在读取元数据...")
 			
-			// 1. 读取服务端发来的 SNI 元数据
 			streamReader := bufio.NewReader(stream)
 			sni, err := streamReader.ReadString('\n')
 			if err != nil {
@@ -464,18 +439,15 @@ func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort in
 			}
 			sni = strings.TrimSpace(sni)
 
-			// 2. 根据 SNI 决定如何连接本地目标
 			var localConn net.Conn
 			if sni != "" {
-				// 有 SNI，建立 TLS 连接，并修正 ServerName
 				log.Printf("检测到 SNI '%s'，正在建立到 %s 的 TLS 连接", sni, localTargetAddr)
 				tlsConfig := &tls.Config{
 					ServerName:         sni,
-					InsecureSkipVerify: true, // PVE证书通常是自签名的或针对主机名，而我们用IP连接，所以需要跳过验证
+					InsecureSkipVerify: true,
 				}
 				localConn, err = tls.Dial("tcp", localTargetAddr, tlsConfig)
 			} else {
-				// 没有 SNI，作为普通 TCP 连接处理
 				log.Printf("未检测到 SNI，正在建立到 %s 的普通 TCP 连接", localTargetAddr)
 				localConn, err = localConnPool.Get()
 			}
@@ -486,7 +458,6 @@ func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort in
 			}
 			defer localConn.Close()
 
-			// 3. 包装 smux 流并进行双向转发
 			wrappedStream := &streamWrapper{
 				reader: streamReader,
 				writer: stream,
@@ -530,8 +501,7 @@ func requestPortForwarding(session *smux.Session, port int) error {
 }
 
 
-// ======================= TLS 和 证书管理 =======================
-// (该部分代码无需修改，保持原样)
+// ======================= TLS 和 证书管理 (无修改) =======================
 func setupClientTLS(caCertPath string) (*tls.Config, error) {
 	caCertPEM, err := os.ReadFile(caCertPath)
 	if err != nil {
@@ -666,9 +636,9 @@ func savePEM(certPath, keyPath string, cert *x509.Certificate, key *ecdsa.Privat
 }
 
 
-// ======================= 主函数 =======================
+// ======================= 主函数 (无修改)  =======================
 func main() {
-	_, _ = rand.Read(make([]byte, 1)) // 确保随机数种子被初始化
+	_, _ = rand.Read(make([]byte, 1))
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
 	if len(os.Args) < 2 {
