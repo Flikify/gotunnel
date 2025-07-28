@@ -1,4 +1,4 @@
-name: build-go-binary
+name: release-go-binary
 
 on:
   release:
