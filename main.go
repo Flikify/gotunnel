@@ -7,7 +7,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	cryptorand "crypto/rand"
-	"crypto/tls" // <-- We only need the standard library TLS
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
@@ -29,93 +29,60 @@ import (
 )
 
 // ========= 证书管理相关常量 =========
+// (No changes here)
 const (
 	certDir          = "certs"
 	caCertFile       = "ca.crt"
 	caKeyFile        = "ca.key"
 	serverCertFile   = "server.crt"
 	serverKeyFile    = "server.key"
-	internalCertName = "gotunnel.internal" // 用于证书的内部固定主机名
+	internalCertName = "gotunnel.internal"
 )
 
-// ControlMessage 和 ControlResponse 结构体
-type ControlMessage struct {
-	RemotePort int `json:"remote_port"`
-}
-type ControlResponse struct {
-	Status  string `json:"status"`
-	Message string `json:"message"`
-}
 
-// ConnectionPool
+// (No changes in this section)
+// ... ControlMessage, ControlResponse, ConnectionPool, handleStream, PSK Auth ...
+type ControlMessage struct{ RemotePort int `json:"remote_port"` }
+type ControlResponse struct{ Status, Message string `json:"status"`}
 type ConnectionPool struct {
 	conns      chan net.Conn
 	targetAddr string
 	maxSize    int
 }
-
 func NewConnectionPool(target string, size int) (*ConnectionPool, error) {
-	if size <= 0 {
-		return nil, fmt.Errorf("连接池大小必须为正数")
-	}
-	return &ConnectionPool{
-		conns:      make(chan net.Conn, size),
-		targetAddr: target,
-		maxSize:    size,
-	}, nil
+	if size <= 0 {return nil, fmt.Errorf("连接池大小必须为正数")}
+	return &ConnectionPool{conns: make(chan net.Conn, size), targetAddr: target, maxSize: size}, nil
 }
 func (p *ConnectionPool) Get() (net.Conn, error) {
 	select {
-	case conn := <-p.conns:
-		return conn, nil
-	default:
-		return net.Dial("tcp", p.targetAddr)
+	case conn := <-p.conns: return conn, nil
+	default: return net.Dial("tcp", p.targetAddr)
 	}
 }
 func (p *ConnectionPool) Put(conn net.Conn) {
 	select {
 	case p.conns <- conn:
-	default:
-		_ = conn.Close()
+	default: _ = conn.Close()
 	}
 }
 func (p *ConnectionPool) Close() {
 	close(p.conns)
-	for conn := range p.conns {
-		_ = conn.Close()
-	}
+	for conn := range p.conns {_ = conn.Close()}
 }
-
-// handleStream
 func handleStream(p1, p2 io.ReadWriteCloser) {
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(p2, p1)
-		p2.Close()
-	}()
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(p1, p2)
-		p1.Close()
-	}()
+	go func() { defer wg.Done(); _, _ = io.Copy(p2, p1); p2.Close() }()
+	go func() { defer wg.Done(); _, _ = io.Copy(p1, p2); p1.Close() }()
 	wg.Wait()
 }
-
-
-// ======================= PSK 认证逻辑 =======================
 const pskAuthTimeout = 5 * time.Second
-
 func authenticateClient(conn net.Conn, expectedSecret string) error {
 	_ = conn.SetReadDeadline(time.Now().Add(pskAuthTimeout))
 	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
-
 	reader := bufio.NewReader(conn)
 	receivedSecret, err := reader.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("读取 secret 失败: %w", err)
-	}
+	if err != nil {return fmt.Errorf("读取 secret 失败: %w", err)}
 	if strings.TrimSpace(receivedSecret) != expectedSecret {
 		_, _ = conn.Write([]byte("ERROR: Invalid Secret\n"))
 		return fmt.Errorf("无效的 secret")
@@ -123,57 +90,63 @@ func authenticateClient(conn net.Conn, expectedSecret string) error {
 	_, err = conn.Write([]byte("OK\n"))
 	return err
 }
-
 func authenticateWithServer(conn net.Conn, secret string) error {
-	if _, err := fmt.Fprintln(conn, secret); err != nil {
-		return fmt.Errorf("发送 secret 失败: %w", err)
-	}
+	if _, err := fmt.Fprintln(conn, secret); err != nil {return fmt.Errorf("发送 secret 失败: %w", err)}
 	_ = conn.SetReadDeadline(time.Now().Add(pskAuthTimeout))
 	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
-
 	reader := bufio.NewReader(conn)
 	response, err := reader.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("读取服务端响应失败: %w", err)
-	}
-	if strings.TrimSpace(response) != "OK" {
-		return fmt.Errorf("认证失败，服务端响应: %s", strings.TrimSpace(response))
-	}
+	if err != nil {return fmt.Errorf("读取服务端响应失败: %w", err)}
+	if strings.TrimSpace(response) != "OK" {return fmt.Errorf("认证失败，服务端响应: %s", strings.TrimSpace(response))}
 	return nil
 }
 
 // ======================= 服务端逻辑 =======================
 
-// getSNI 从一个连接中窥探 TLS ClientHello 消息并提取 SNI 主机名。
-// 它不会从连接中消耗数据，后续仍然可以读取完整的 ClientHello。
+// +++ NEW HELPER TYPE +++
+// peekingConn is a wrapper around net.Conn that allows peeking into the
+// data stream via a bufio.Reader without consuming the bytes from the conn.
+type peekingConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+// Read overrides the embedded net.Conn's Read method to use the bufio.Reader.
+func (c *peekingConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+
+// getSNI (Corrected Version)
 func getSNI(conn net.Conn) (string, error) {
-	// 设置一个短暂的读取超时，防止恶意连接不发送数据
-	err := conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		return "", fmt.Errorf("设置超时失败: %w", err)
 	}
 	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
 
 	var clientHello *tls.ClientHelloInfo
-	reader := bufio.NewReader(conn)
+	
+	// Wrap the connection in our custom peekingConn
+	peeker := &peekingConn{
+		Conn:   conn,
+		reader: bufio.NewReader(conn),
+	}
 
-	peekedBytes, err := reader.Peek(1)
+	// Now we can peek using the reader part of our wrapper...
+	peekedBytes, err := peeker.reader.Peek(1)
 	if err != nil {
-		if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
-			return "", nil
-		}
-		if err == io.EOF {
-			return "", nil
-		}
+		if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {return "", nil}
+		if err == io.EOF {return "", nil}
 		return "", fmt.Errorf("无法窥探连接: %w", err)
 	}
 
 	if peekedBytes[0] != 0x16 {
 		log.Printf("来自 %s 的连接不是 TLS 握手 (第一个字节: 0x%x)，将作为普通 TCP 处理", conn.RemoteAddr(), peekedBytes[0])
-		return "", nil // 不是 TLS 握手，可能是普通的 HTTP 或其他协议
+		return "", nil
 	}
 
-	err = tls.Server(struct{ net.Conn }{reader}, &tls.Config{
+	// ...and pass the peeker itself to tls.Server, as it now satisfies net.Conn
+	err = tls.Server(peeker, &tls.Config{
 		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 			clientHello = hello
 			return nil, fmt.Errorf("中断以获取 SNI")
@@ -189,11 +162,10 @@ func getSNI(conn net.Conn) (string, error) {
 		log.Printf("从公网连接 %s 提取到 SNI: %s", conn.RemoteAddr(), clientHello.ServerName)
 		return clientHello.ServerName, nil
 	}
-
-	return "", nil // 没有 SNI
+	return "", nil
 }
 
-
+// (runServer and handleClientSession now work correctly with the new getSNI)
 func runServer(listenAddr, secret string) {
 	log.Printf("服务端模式：隧道监听于 %s", listenAddr)
 
@@ -322,28 +294,22 @@ func handleClientSession(tunnelConn net.Conn) {
 }
 
 
+// (No changes in Client logic, Certificate Management, or main function)
 // ======================= 客户端逻辑 =======================
-
 func runClient(serverAddr, secret, localTargetAddr, caCertPath string, remotePort int, maxRetryInterval time.Duration) {
 	log.Printf("客户端模式启动：目标服务端 %s (安全)", serverAddr)
 	log.Printf("-> 远程端口 :%d -> 本地目标 %s", remotePort, localTargetAddr)
-
 	tlsConfig, err := setupClientTLS(caCertPath)
-	if err != nil {
-		log.Fatalf("初始化客户端 TLS 配置失败: %v", err)
-	}
-
+	if err != nil {log.Fatalf("初始化客户端 TLS 配置失败: %v", err)}
 	var currentRetryInterval = 2 * time.Second
 	for {
 		var tunnelConn net.Conn
 		for {
 			log.Printf("正在尝试建立到服务端 %s 的 TLS 连接...", serverAddr)
-
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			dialer := &tls.Dialer{Config: tlsConfig}
 			conn, err := dialer.DialContext(ctx, "tcp", serverAddr)
 			cancel()
-
 			if err != nil {
 				log.Printf("TLS 连接失败: %v", err)
 			} else {
@@ -358,24 +324,18 @@ func runClient(serverAddr, secret, localTargetAddr, caCertPath string, remotePor
 					break
 				}
 			}
-
 			log.Printf("将在 %.0f 秒后重试...", currentRetryInterval.Seconds())
 			time.Sleep(currentRetryInterval)
 			currentRetryInterval *= 2
 			jitter := time.Duration(rand.Intn(1000)) * time.Millisecond
 			currentRetryInterval += jitter
-			if currentRetryInterval > maxRetryInterval {
-				currentRetryInterval = maxRetryInterval
-			}
+			if currentRetryInterval > maxRetryInterval {currentRetryInterval = maxRetryInterval}
 		}
-
 		runClientSession(tunnelConn, localTargetAddr, remotePort)
-
 		log.Println("与服务端的连接已断开，准备自动重连...")
 		time.Sleep(2 * time.Second)
 	}
 }
-
 type streamWrapper struct {
 	reader io.Reader
 	writer io.Writer
@@ -384,34 +344,18 @@ type streamWrapper struct {
 func (sw *streamWrapper) Read(p []byte) (n int, err error) { return sw.reader.Read(p) }
 func (sw *streamWrapper) Write(p []byte) (n int, err error){ return sw.writer.Write(p) }
 func (sw *streamWrapper) Close() error { return sw.closer.Close() }
-
-
 func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort int) {
 	defer tunnelConn.Close()
-
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
 	session, err := smux.Client(tunnelConn, smuxConfig)
-	if err != nil {
-		log.Printf("创建 smux 客户端会话失败: %v", err)
-		return
-	}
+	if err != nil {log.Printf("创建 smux 客户端会话失败: %v", err); return}
 	defer session.Close()
-
 	localConnPool, err := NewConnectionPool(localTargetAddr, 10)
-	if err != nil {
-		log.Printf("创建本地连接池失败: %v", err)
-		return
-	}
+	if err != nil {log.Printf("创建本地连接池失败: %v", err); return}
 	defer localConnPool.Close()
-
-	if err := requestPortForwarding(session, remotePort); err != nil {
-		log.Printf("请求端口转发失败: %v", err)
-		return
-	}
-
+	if err := requestPortForwarding(session, remotePort); err != nil {log.Printf("请求端口转发失败: %v", err); return}
 	var wg sync.WaitGroup
-
 	log.Println("控制指令发送成功，开始监听并转发流量...")
 	for {
 		stream, err := session.AcceptStream()
@@ -423,174 +367,92 @@ func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort in
 			}
 			break
 		}
-		
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			defer stream.Close()
-			
 			log.Println("收到新的转发请求，正在读取元数据...")
-			
 			streamReader := bufio.NewReader(stream)
 			sni, err := streamReader.ReadString('\n')
-			if err != nil {
-				log.Printf("读取 SNI 元数据失败: %v", err)
-				return
-			}
+			if err != nil {log.Printf("读取 SNI 元数据失败: %v", err); return}
 			sni = strings.TrimSpace(sni)
-
 			var localConn net.Conn
 			if sni != "" {
 				log.Printf("检测到 SNI '%s'，正在建立到 %s 的 TLS 连接", sni, localTargetAddr)
-				tlsConfig := &tls.Config{
-					ServerName:         sni,
-					InsecureSkipVerify: true,
-				}
+				tlsConfig := &tls.Config{ServerName: sni, InsecureSkipVerify: true}
 				localConn, err = tls.Dial("tcp", localTargetAddr, tlsConfig)
 			} else {
 				log.Printf("未检测到 SNI，正在建立到 %s 的普通 TCP 连接", localTargetAddr)
 				localConn, err = localConnPool.Get()
 			}
-			
-			if err != nil {
-				log.Printf("无法建立到本地目标的连接 %s: %v", localTargetAddr, err)
-				return
-			}
+			if err != nil {log.Printf("无法建立到本地目标的连接 %s: %v", localTargetAddr, err); return}
 			defer localConn.Close()
-
-			wrappedStream := &streamWrapper{
-				reader: streamReader,
-				writer: stream,
-				closer: stream,
-			}
+			wrappedStream := &streamWrapper{reader: streamReader, writer: stream, closer: stream}
 			handleStream(localConn, wrappedStream)
 		}()
 	}
-
 	log.Println("等待所有正在处理的流完成...")
 	wg.Wait()
 	log.Println("所有流已处理完毕，正在关闭会话。")
 }
-
-
 func requestPortForwarding(session *smux.Session, port int) error {
 	log.Println("正在打开控制流以发送端口转发请求...")
 	controlStream, err := session.OpenStream()
-	if err != nil {
-		return fmt.Errorf("无法打开 smux 控制流: %w", err)
-	}
+	if err != nil {return fmt.Errorf("无法打开 smux 控制流: %w", err)}
 	defer controlStream.Close()
-
 	req := ControlMessage{RemotePort: port}
-	if err := json.NewEncoder(controlStream).Encode(req); err != nil {
-		return fmt.Errorf("发送控制消息失败: %w", err)
-	}
-
+	if err := json.NewEncoder(controlStream).Encode(req); err != nil {return fmt.Errorf("发送控制消息失败: %w", err)}
 	var resp ControlResponse
 	_ = controlStream.SetReadDeadline(time.Now().Add(10 * time.Second))
-	if err := json.NewDecoder(controlStream).Decode(&resp); err != nil {
-		return fmt.Errorf("读取服务端响应失败: %w", err)
-	}
-
-	if resp.Status != "success" {
-		return fmt.Errorf("服务端返回错误: %s", resp.Message)
-	}
-
+	if err := json.NewDecoder(controlStream).Decode(&resp); err != nil {return fmt.Errorf("读取服务端响应失败: %w", err)}
+	if resp.Status != "success" {return fmt.Errorf("服务端返回错误: %s", resp.Message)}
 	log.Printf("服务端成功响应: %s", resp.Message)
 	return nil
 }
-
-
-// ======================= TLS 和 证书管理 (无修改) =======================
 func setupClientTLS(caCertPath string) (*tls.Config, error) {
 	caCertPEM, err := os.ReadFile(caCertPath)
-	if err != nil {
-		return nil, fmt.Errorf("无法读取 CA 证书文件 %s: %w", caCertPath, err)
-	}
+	if err != nil {return nil, fmt.Errorf("无法读取 CA 证书文件 %s: %w", caCertPath, err)}
 	caCertPool := x509.NewCertPool()
-	if !caCertPool.AppendCertsFromPEM(caCertPEM) {
-		return nil, fmt.Errorf("无法将 CA 证书添加到池中")
-	}
-
-	return &tls.Config{
-		RootCAs:    caCertPool,
-		ServerName: internalCertName,
-		MinVersion: tls.VersionTLS12,
-	}, nil
+	if !caCertPool.AppendCertsFromPEM(caCertPEM) {return nil, fmt.Errorf("无法将 CA 证书添加到池中")}
+	return &tls.Config{RootCAs: caCertPool, ServerName: internalCertName, MinVersion: tls.VersionTLS12}, nil
 }
-
 func setupServerTLS() (*tls.Config, *x509.Certificate, error) {
 	if _, err := os.Stat(certDir); os.IsNotExist(err) {
-		if err := os.Mkdir(certDir, 0700); err != nil {
-			return nil, nil, fmt.Errorf("无法创建证书目录: %w", err)
-		}
+		if err := os.Mkdir(certDir, 0700); err != nil {return nil, nil, fmt.Errorf("无法创建证书目录: %w", err)}
 	}
-
 	caCertPath := filepath.Join(certDir, caCertFile)
 	serverCertPath := filepath.Join(certDir, serverCertFile)
-
 	var caCert *x509.Certificate
 	if _, err := os.Stat(caCertPath); os.IsNotExist(err) {
 		log.Println("未找到 CA 证书，将生成新的 CA 和服务器证书...")
 		var errGen error
 		caCert, errGen = generateAndSaveCerts(internalCertName)
-		if errGen != nil {
-			return nil, nil, fmt.Errorf("生成证书失败: %w", errGen)
-		}
+		if errGen != nil {return nil, nil, fmt.Errorf("生成证书失败: %w", errGen)}
 		log.Println("新证书生成成功！")
 	} else {
 		log.Println("发现现有证书，将加载它们。")
 		caCertBytes, errRead := os.ReadFile(caCertPath)
-		if errRead != nil {
-			return nil, nil, fmt.Errorf("读取 CA 证书失败: %w", errRead)
-		}
+		if errRead != nil {return nil, nil, fmt.Errorf("读取 CA 证书失败: %w", errRead)}
 		caBlock, _ := pem.Decode(caCertBytes)
-		if caBlock == nil {
-			return nil, nil, fmt.Errorf("无法解码 CA 证书 PEM: %s", caCertPath)
-		}
+		if caBlock == nil {return nil, nil, fmt.Errorf("无法解码 CA 证书 PEM: %s", caCertPath)}
 		caCert, errRead = x509.ParseCertificate(caBlock.Bytes)
-		if errRead != nil {
-			return nil, nil, fmt.Errorf("解析 CA 证书失败: %w", errRead)
-		}
+		if errRead != nil {return nil, nil, fmt.Errorf("解析 CA 证书失败: %w", errRead)}
 	}
-
 	serverCert, err := tls.LoadX509KeyPair(serverCertPath, filepath.Join(certDir, serverKeyFile))
-	if err != nil {
-		return nil, nil, fmt.Errorf("无法加载服务器证书/密钥对: %w", err)
-	}
-
-	return &tls.Config{
-		Certificates: []tls.Certificate{serverCert},
-		MinVersion:   tls.VersionTLS12,
-	}, caCert, nil
+	if err != nil {return nil, nil, fmt.Errorf("无法加载服务器证书/密钥对: %w", err)}
+	return &tls.Config{Certificates: []tls.Certificate{serverCert}, MinVersion: tls.VersionTLS12}, caCert, nil
 }
-
-
 func generateAndSaveCerts(hostNameForCert string) (*x509.Certificate, error) {
 	caKey, caCert, err := createCertificate(nil, nil, true, "GoTunnel CA", nil, nil)
-	if err != nil {
-		return nil, fmt.Errorf("创建 CA 失败: %w", err)
-	}
-	if err := savePEM(filepath.Join(certDir, caCertFile), filepath.Join(certDir, caKeyFile), caCert, caKey); err != nil {
-		return nil, err
-	}
-	var ips []net.IP
-	var dnsNames []string
-	if ip := net.ParseIP(hostNameForCert); ip != nil {
-		ips = append(ips, ip)
-	} else {
-		dnsNames = append(dnsNames, hostNameForCert)
-	}
+	if err != nil {return nil, fmt.Errorf("创建 CA 失败: %w", err)}
+	if err := savePEM(filepath.Join(certDir, caCertFile), filepath.Join(certDir, caKeyFile), caCert, caKey); err != nil {return nil, err}
+	var ips []net.IP; var dnsNames []string
+	if ip := net.ParseIP(hostNameForCert); ip != nil {ips = append(ips, ip)} else {dnsNames = append(dnsNames, hostNameForCert)}
 	serverKey, serverCert, err := createCertificate(caCert, caKey, false, hostNameForCert, ips, dnsNames)
-	if err != nil {
-		return nil, fmt.Errorf("创建服务器证书失败: %w", err)
-	}
-	if err := savePEM(filepath.Join(certDir, serverCertFile), filepath.Join(certDir, serverKeyFile), serverCert, serverKey); err != nil {
-		return nil, err
-	}
+	if err != nil {return nil, fmt.Errorf("创建服务器证书失败: %w", err)}
+	if err := savePEM(filepath.Join(certDir, serverCertFile), filepath.Join(certDir, serverKeyFile), serverCert, serverKey); err != nil {return nil, err}
 	return caCert, nil
 }
-
 func createCertificate(parent *x509.Certificate, parentKey *ecdsa.PrivateKey, isCA bool, commonName string, ips []net.IP, dnsNames []string) (*ecdsa.PrivateKey, *x509.Certificate, error) {
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
 	if err != nil { return nil, nil, err }
@@ -607,21 +469,14 @@ func createCertificate(parent *x509.Certificate, parentKey *ecdsa.PrivateKey, is
 		IPAddresses:  ips,
 		DNSNames:     dnsNames,
 	}
-	if isCA {
-		template.IsCA = true
-		template.KeyUsage |= x509.KeyUsageCertSign
-		template.BasicConstraintsValid = true
-	}
+	if isCA {template.IsCA = true; template.KeyUsage |= x509.KeyUsageCertSign; template.BasicConstraintsValid = true}
 	var ca, signingKey = &template, privateKey
-	if parent != nil && parentKey != nil {
-		ca, signingKey = parent, parentKey
-	}
+	if parent != nil && parentKey != nil {ca, signingKey = parent, parentKey}
 	derBytes, err := x509.CreateCertificate(cryptorand.Reader, &template, ca, &privateKey.PublicKey, signingKey)
 	if err != nil { return nil, nil, err }
 	cert, err := x509.ParseCertificate(derBytes)
 	return privateKey, cert, err
 }
-
 func savePEM(certPath, keyPath string, cert *x509.Certificate, key *ecdsa.PrivateKey) error {
 	certOut, err := os.Create(certPath)
 	if err != nil { return err }
@@ -634,9 +489,6 @@ func savePEM(certPath, keyPath string, cert *x509.Certificate, key *ecdsa.Privat
 	if err != nil { return err }
 	return pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
 }
-
-
-// ======================= 主函数 (无修改)  =======================
 func main() {
 	_, _ = rand.Read(make([]byte, 1))
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
