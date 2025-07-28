@@ -171,10 +171,10 @@ func runServer(listenAddr, secret string) {
 	}
 }
 
+// ======================= vvvvvvvvvv THIS FUNCTION HAS BEEN FIXED vvvvvvvvvv =======================
 func handleClientSession(tunnelConn net.Conn) {
 	defer tunnelConn.Close()
 
-	// <<< FINAL FIX - PART 1 >>>
 	// 配置 smux 以防止空闲连接被网络中间设备关闭
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
@@ -213,24 +213,29 @@ func handleClientSession(tunnelConn net.Conn) {
 		return
 	}
 	
+	// ★★★ FIX START: 启动一个 goroutine 来监控 smux 会话的生命周期 ★★★
+	// 这是解决资源泄漏的关键: 当隧道连接断开时，我们必须主动关闭公网监听器。
 	go func() {
-		ticker := time.NewTicker(1 * time.Second)
+		// 使用定时器定期检查会话是否关闭。这是处理网络异常断开的最可靠方法。
+		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			if session.IsClosed() {
-				log.Printf("[%s] 检测到 smux 会话已关闭，正在关闭公网监听器 %s", tunnelConn.RemoteAddr(), publicListener.Addr())
+				log.Printf("[%s] 检测到smux会话已关闭，正在关闭公网监听器 %s", tunnelConn.RemoteAddr(), publicListener.Addr())
+				// 关闭监听器将导致下面的 Accept() 调用返回错误，从而使主 goroutine 退出。
 				publicListener.Close()
-				return
+				return // 监控 goroutine 结束
 			}
 		}
 	}()
+	// ★★★ FIX END ★★★
 
 	successMsg := fmt.Sprintf("成功在 %s 上监听, 准备转发流量", publicListener.Addr().String())
 	log.Printf("[%s] %s", tunnelConn.RemoteAddr(), successMsg)
 	
 	if err := json.NewEncoder(controlStream).Encode(ControlResponse{Status: "success", Message: successMsg}); err != nil {
 		log.Printf("[%s] 发送成功响应失败: %v", tunnelConn.RemoteAddr(), err)
-		publicListener.Close()
+		publicListener.Close() // 发送失败也应关闭监听器
 		return
 	}
 
@@ -238,9 +243,13 @@ func handleClientSession(tunnelConn net.Conn) {
 	for {
 		userConn, err := publicListener.Accept()
 		if err != nil {
+			// 当 publicListener 被监控 goroutine 关闭时，这里会收到错误。
+			// 这是预期的行为，表明底层的隧道连接已断开。
 			log.Printf("[%s] 公网监听器已关闭或遇到错误，停止接受新连接。原因: %v", tunnelConn.RemoteAddr(), err)
-			return
+			return // 正常退出 handleClientSession，释放所有资源。
 		}
+
+		// 再次检查，以防在 Accept() 返回和 goroutine 启动之间会话关闭
 		if session.IsClosed() {
 			log.Printf("[%s] 会话已关闭，拒绝新的公网连接 %s", tunnelConn.RemoteAddr(), userConn.RemoteAddr())
 			userConn.Close()
@@ -268,6 +277,9 @@ func handleClientSession(tunnelConn net.Conn) {
 		}(userConn)
 	}
 }
+// ======================= ^^^^^^^^^^ THIS FUNCTION HAS BEEN FIXED ^^^^^^^^^^ =======================
+
+
 
 // ======================= 客户端逻辑 =======================
 func runClient(serverAddr, secret, localTargetAddr, caCertPath string, remotePort int, maxRetryInterval time.Duration) {
@@ -322,7 +334,6 @@ func (sw *streamWrapper) Close() error { return sw.closer.Close() }
 func runClientSession(tunnelConn net.Conn, localTargetAddr string, remotePort int) {
 	defer tunnelConn.Close()
 	
-	// <<< FINAL FIX - PART 2 >>>
 	// 客户端必须配置与服务端兼容的心跳机制
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
@@ -517,3 +528,4 @@ func main() {
 		os.Exit(1)
 	}
 }
+
